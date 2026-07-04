@@ -128,7 +128,95 @@ class LegalRAG:
     2. HyDE：先生成假设性回答，再用假设性回答参与检索
     3. Context Enrichment：检索小 chunk，生成时补充 parent_text
     4. Hybrid Search：向量检索 + 关键词重排
+    5. Category-aware Search：按法律类别精准检索
     """
+
+    # 法律类别关键词映射（用于自动分类）
+    LAW_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+        "civil_code": [
+            "合同", "违约", "物权", "抵押", "质押", "婚姻", "离婚", "继承", "遗嘱",
+            "侵权", "赔偿", "民事", "债权", "债务", "法人", "自然人", "民事责任",
+            "民法典", "合同法", "物权法", "婚姻法", "继承法", "侵权责任",
+        ],
+        "criminal_law": [
+            "犯罪", "刑罚", "刑事", "盗窃", "诈骗", "故意伤害", "故意杀人", "抢劫",
+            "贪污", "受贿", "渎职", "有期徒刑", "无期徒刑", "死刑", "罚金",
+            "累犯", "自首", "立功", "缓刑", "假释", "追诉", "刑事责任", "刑法",
+        ],
+        "administrative_law": [
+            "行政处罚", "行政许可", "行政复议", "行政诉讼", "行政强制", "国家赔偿",
+            "行政机关", "具体行政行为", "抽象行政行为", "行政违法", "行政处分",
+            "听证", "行政法", "行政拘留", "行政罚款",
+        ],
+        "constitution": [
+            "宪法", "公民权利", "基本权利", "国家机构", "全国人大", "国务院",
+            "根本法", "违宪", "选举权", "言论自由", "人身自由",
+        ],
+        "economic_law": [
+            "公司", "股东", "董事会", "反垄断", "不正当竞争", "消费者", "产品质量",
+            "税务", "税收", "所得税", "增值税", "金融", "银行", "证券", "保险",
+            "广告", "招标", "投标", "拍卖", "经济法", "合伙企业", "个人独资",
+        ],
+        "environmental_law": [
+            "环境", "污染", "环保", "生态", "大气", "水", "土壤", "固体废物",
+            "噪声", "放射性", "海洋", "森林", "草原", "矿产", "野生动物",
+            "长江保护", "黄河保护", "环境影响评价", "排污",
+        ],
+        "social_law": [
+            "劳动", "劳动合同", "工伤", "社会保险", "社保", "养老金", "医疗",
+            "失业", "工会", "就业", "劳动争议", "仲裁", "未成年人", "老年人",
+            "残疾人", "妇女权益", "职业病", "安全生产", "慈善", "社会法",
+        ],
+        "commercial_law": [
+            "票据", "汇票", "本票", "支票", "破产", "清算", "海商", "海事",
+            "信托", "保险合同", "商法", "票据法", "破产法", "海商法",
+        ],
+    }
+
+    # 文件名到法律类别的映射
+    FILENAME_CATEGORY_MAP: dict[str, str] = {
+        "civil_code.md": "civil_code",
+        "民法典": "civil_code",
+        "criminal_law.md": "criminal_law",
+        "刑法": "criminal_law",
+        "administrative_law.md": "administrative_law",
+        "行政法": "administrative_law",
+        "constitution.md": "constitution",
+        "宪法": "constitution",
+        "economic_law.md": "economic_law",
+        "经济法": "economic_law",
+        "environmental_law.md": "environmental_law",
+        "环境法": "environmental_law",
+        "social_law.md": "social_law",
+        "社会法": "social_law",
+        "commercial_law.md": "commercial_law",
+        "商法": "commercial_law",
+        "商业法": "commercial_law",
+    }
+
+    def classify_legal_category(self, text: str) -> str:
+        """
+        根据文本内容自动判断所属法律类别。
+
+        返回匹配度最高的类别ID；无法判断时返回 "general"。
+        """
+        scores: dict[str, int] = {}
+        for category, keywords in self.LAW_CATEGORY_KEYWORDS.items():
+            score = sum(1 for kw in keywords if kw in text)
+            if score > 0:
+                scores[category] = score
+
+        if not scores:
+            return "general"
+
+        return max(scores.items(), key=lambda x: x[1])[0]
+
+    def detect_category_from_filename(self, filename: str) -> str:
+        """从文件名推断法律类别。"""
+        for key, category in self.FILENAME_CATEGORY_MAP.items():
+            if key.lower() in filename.lower():
+                return category
+        return "general"
 
     def __init__(
         self,
@@ -211,13 +299,21 @@ class LegalRAG:
         text: str,
         source: str,
         reset_source: bool = True,
+        law_category: Optional[str] = None,
     ) -> int:
         """
         将一段文本写入 ChromaDB。
 
         reset_source=True:
             重复索引同一个 source 时，先删除旧数据，避免重复。
+
+        law_category:
+            法律类别，如不指定则自动从 source 文件名推断。
         """
+        # 自动推断法律类别
+        if law_category is None:
+            law_category = self.detect_category_from_filename(source)
+
         chunks = self.chunk_text(text=text, source=source)
 
         if not chunks:
@@ -235,6 +331,7 @@ class LegalRAG:
                 "source": chunk.source,
                 "chunk_index": chunk.chunk_index,
                 "parent_text": chunk.parent_text,
+                "law_category": law_category,
             }
             for chunk in chunks
         ]
@@ -363,6 +460,8 @@ class LegalRAG:
         top_k: int = 4,
         use_llm_query_transform: bool = True,
         use_llm_hyde: bool = True,
+        law_categories: Optional[list[str]] = None,
+        auto_detect_category: bool = False,
     ) -> tuple[list[RAGSearchResult], list[str], str]:
         """
         执行进阶检索流程。
@@ -372,6 +471,22 @@ class LegalRAG:
         2. 改写后的查询列表
         3. HyDE 假设回答
         """
+        # 自动检测法律类别
+        if law_categories is None and auto_detect_category:
+            detected = self.classify_legal_category(question)
+            if detected != "general":
+                law_categories = [detected]
+
+        # 构建 ChromaDB where 过滤条件
+        where_filter = None
+        if law_categories and len(law_categories) > 0:
+            if len(law_categories) == 1:
+                where_filter = {"law_category": law_categories[0]}
+            else:
+                where_filter = {
+                    "$or": [{"law_category": cat} for cat in law_categories]
+                }
+
         transformed_queries = await self.transform_query(
             question,
             use_llm=use_llm_query_transform,
@@ -394,6 +509,7 @@ class LegalRAG:
                 query_embeddings=[query_embedding],
                 n_results=top_k,
                 include=["documents", "metadatas", "distances"],
+                where=where_filter,
             )
 
             ids = raw.get("ids", [[]])[0]

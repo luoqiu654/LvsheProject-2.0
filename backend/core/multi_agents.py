@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, TypedDict
 
@@ -1301,6 +1302,407 @@ async def _demo() -> None:
 
     print("\n法官详细总结：")
     print(result.judge_summary)
+
+
+# ========== 以下为 v3 版本：子 Agent 自主检索 + 针对性攻防辩论 ==========
+
+@dataclass
+class AgentDebateRound:
+    """v3版本：单轮辩论记录。"""
+    round_num: int
+    plaintiff_statement: str
+    plaintiff_legal_basis: list[str]  # 原告引用的法律依据
+    defendant_statement: str
+    defendant_legal_basis: list[str]  # 被告引用的法律依据
+    judge_comment: str = ""
+    convergence_score: float = 0.0
+
+
+class DebateAgent:
+    """
+    辩论角色子 Agent。
+
+    每个角色都具备：
+    1. 自主 RAG 检索能力：从法律知识库中查找相关依据
+    2. 立场导向：根据己方角色选择有利的法律条文
+    3. 针对性反驳：分析对方论点漏洞，组织反击
+    """
+
+    def __init__(
+        self,
+        role: str,  # "plaintiff" / "defendant" / "judge"
+        llm_gateway: Optional[LLMGateway] = None,
+        rag: Optional[LegalRAG] = None,
+    ) -> None:
+        self.role = role
+        self.llm_gateway = llm_gateway or default_gateway
+        self.rag = rag or default_rag
+
+    async def retrieve_legal_basis(
+        self,
+        case: str,
+        focus_points: list[str],
+        opponent_args: Optional[str] = None,
+        top_k: int = 5,
+    ) -> list[str]:
+        """
+        自主检索法律依据。
+
+        根据案情和争议焦点，自动判断法律类别，检索相关法条。
+        如果有对方论点，会针对性检索反驳依据。
+        """
+        # 构建检索查询
+        queries = [case] + focus_points
+        if opponent_args:
+            queries.append(f"反驳以下论点的法律依据：{opponent_args[:300]}")
+
+        all_contexts = []
+        for query in queries[:3]:  # 最多3个查询
+            contexts, _, _ = await self.rag.search(
+                question=query,
+                top_k=top_k,
+                auto_detect_category=True,
+                use_llm_query_transform=False,
+                use_llm_hyde=False,
+            )
+            all_contexts.extend(contexts)
+
+        # 去重并提取法条内容
+        seen = set()
+        legal_basis = []
+        for ctx in all_contexts:
+            if ctx.text not in seen and len(ctx.text.strip()) > 10:
+                seen.add(ctx.text)
+                legal_basis.append(f"[{ctx.source}] {ctx.text[:200]}")
+                if len(legal_basis) >= 6:
+                    break
+
+        return legal_basis
+
+    async def generate_argument(
+        self,
+        case: str,
+        legal_basis: list[str],
+        opponent_last_statement: Optional[str] = None,
+        round_num: int = 1,
+        debate_history: list[dict] | None = None,
+    ) -> str:
+        """生成辩论发言。"""
+        role_prompts = {
+            "plaintiff": self._plaintiff_prompt,
+            "defendant": self._defendant_prompt,
+        }
+        prompt_fn = role_prompts.get(self.role)
+        if not prompt_fn:
+            return ""
+
+        prompt = prompt_fn(
+            case=case,
+            legal_basis=legal_basis,
+            opponent_last_statement=opponent_last_statement,
+            round_num=round_num,
+            debate_history=debate_history or [],
+        )
+
+        try:
+            return await self.llm_gateway.chat_text(
+                user_message=prompt,
+                system_message=f"你是法庭{self._role_name()}，专业、严谨、有逻辑，善于运用法律条文。",
+                max_tokens=800,
+                temperature=0.7,
+            )
+        except LLMGatewayError:
+            return self._fallback_argument(case, legal_basis, round_num)
+
+    def _role_name(self) -> str:
+        return {
+            "plaintiff": "原告代理人",
+            "defendant": "被告代理人",
+            "judge": "法官",
+        }.get(self.role, self.role)
+
+    def _plaintiff_prompt(
+        self,
+        case: str,
+        legal_basis: list[str],
+        opponent_last_statement: Optional[str],
+        round_num: int,
+        debate_history: list[dict],
+    ) -> str:
+        basis_text = "\n".join(f"- {b}" for b in legal_basis) if legal_basis else "（暂未检索到具体法条）"
+
+        if round_num == 1:
+            return f"""
+你是原告方代理律师。请针对以下案件，代表原告提出诉讼主张和法律依据。
+
+【案件事实】
+{case}
+
+【可引用的法律依据】
+{basis_text}
+
+【要求】
+1. 明确原告的核心诉讼请求
+2. 陈述事实与理由
+3. 引用相关法律条文支撑主张
+4. 逻辑清晰，分点陈述
+5. 字数控制在300-500字
+
+请直接输出原告代理意见：
+""".strip()
+        else:
+            return f"""
+你是原告方代理律师。这是第 {round_num} 轮辩论。
+
+【案件事实】
+{case}
+
+【被告上一轮论点】
+{opponent_last_statement[:500] if opponent_last_statement else "无"}
+
+【可引用的法律依据】
+{basis_text}
+
+【要求】
+1. 针对被告上一轮的论点进行逐一反驳
+2. 找出被告论述中的法律漏洞和事实偏差
+3. 用法律条文强化己方主张
+4. 保持专业、理性的辩论风格
+5. 字数控制在300-500字
+
+请直接输出原告反驳意见：
+""".strip()
+
+    def _defendant_prompt(
+        self,
+        case: str,
+        legal_basis: list[str],
+        opponent_last_statement: Optional[str],
+        round_num: int,
+        debate_history: list[dict],
+    ) -> str:
+        basis_text = "\n".join(f"- {b}" for b in legal_basis) if legal_basis else "（暂未检索到具体法条）"
+
+        return f"""
+你是被告方代理律师。这是第 {round_num} 轮辩论。
+
+【案件事实】
+{case}
+
+【原告上一轮主张】
+{opponent_last_statement[:500] if opponent_last_statement else "原告尚未陈述"}
+
+【可引用的法律依据】
+{basis_text}
+
+【要求】
+1. 针对原告的诉讼请求和事实理由进行抗辩
+2. 找出原告诉求中的法律依据不足、事实不清之处
+3. 提出对被告有利的法律解释和事实主张
+4. 引用相关法律条文支撑抗辩
+5. 逻辑清晰，分点反驳
+6. 字数控制在300-500字
+
+请直接输出被告抗辩意见：
+""".strip()
+
+    def _fallback_argument(self, case: str, legal_basis: list[str], round_num: int) -> str:
+        role_name = self._role_name()
+        basis = "；".join(legal_basis[:3]) if legal_basis else "相关法律规定"
+        return f"【{role_name}第{round_num}轮意见】基于案件事实和{basis}，{self.role}方坚持己方立场。"
+
+
+class EnhancedMultiAgentDebate:
+    """
+    v3 增强版多智能体辩论系统。
+
+    核心升级：
+    1. 每个角色都是独立子 Agent，具备自主 RAG 检索能力
+    2. 原告、被告各自从法律知识库中寻找对己方有利的依据
+    3. 每轮辩论针对对方上一轮论点的漏洞进行反击
+    4. 自动识别法律类别，精准检索相关法条
+    """
+
+    def __init__(
+        self,
+        llm_gateway: Optional[LLMGateway] = None,
+        rag: Optional[LegalRAG] = None,
+    ) -> None:
+        self.llm_gateway = llm_gateway or default_gateway
+        self.rag = rag or default_rag
+
+        # 初始化三个角色 Agent
+        self.plaintiff_agent = DebateAgent("plaintiff", llm_gateway, rag)
+        self.defendant_agent = DebateAgent("defendant", llm_gateway, rag)
+
+    async def run_debate(
+        self,
+        case: str,
+        max_rounds: int = 5,
+        convergence_threshold: float = 80.0,
+        use_llm: bool = True,
+    ) -> dict:
+        """
+        运行完整的增强版辩论流程。
+
+        返回：
+            {
+                "case": 案件描述,
+                "rounds": [AgentDebateRound],
+                "final_verdict": 最终判决,
+                "total_rounds": 总轮数,
+            }
+        """
+        rounds: list[AgentDebateRound] = []
+        plaintiff_statement = ""
+        defendant_statement = ""
+
+        for current_round in range(1, max_rounds + 1):
+            # ===== 原告方：检索法律依据 + 生成主张 =====
+            plaintiff_focus = self._extract_focus_points(case, "plaintiff")
+            plaintiff_basis = await self.plaintiff_agent.retrieve_legal_basis(
+                case=case,
+                focus_points=plaintiff_focus,
+                opponent_args=defendant_statement if current_round > 1 else None,
+            )
+            plaintiff_statement = await self.plaintiff_agent.generate_argument(
+                case=case,
+                legal_basis=plaintiff_basis,
+                opponent_last_statement=defendant_statement if current_round > 1 else None,
+                round_num=current_round,
+            )
+
+            # ===== 被告方：检索法律依据 + 针对性抗辩 =====
+            defendant_focus = self._extract_focus_points(case, "defendant")
+            defendant_basis = await self.defendant_agent.retrieve_legal_basis(
+                case=case,
+                focus_points=defendant_focus,
+                opponent_args=plaintiff_statement,
+            )
+            defendant_statement = await self.defendant_agent.generate_argument(
+                case=case,
+                legal_basis=defendant_basis,
+                opponent_last_statement=plaintiff_statement,
+                round_num=current_round,
+            )
+
+            # ===== 收敛度计算 =====
+            convergence = self._calculate_convergence(plaintiff_statement, defendant_statement)
+
+            # 记录本轮
+            round_record = AgentDebateRound(
+                round_num=current_round,
+                plaintiff_statement=plaintiff_statement,
+                plaintiff_legal_basis=plaintiff_basis,
+                defendant_statement=defendant_statement,
+                defendant_legal_basis=defendant_basis,
+                convergence_score=convergence,
+            )
+            rounds.append(round_record)
+
+            # 检查是否提前终止
+            if convergence >= convergence_threshold:
+                break
+
+        # ===== 生成最终判决 =====
+        final_verdict = await self._generate_final_verdict(case, rounds)
+
+        return {
+            "case": case,
+            "rounds": rounds,
+            "final_verdict": final_verdict,
+            "total_rounds": len(rounds),
+        }
+
+    def _extract_focus_points(self, case: str, role: str) -> list[str]:
+        """从案件中提取争议焦点（简化版关键词提取）。"""
+        keywords = ["赔偿", "违约", "合同", "侵权", "责任", "损失", "过错", "解除", "履行"]
+        focus = [kw for kw in keywords if kw in case]
+        return focus[:3] if focus else ["案件核心争议"]
+
+    def _calculate_convergence(self, p_text: str, d_text: str) -> float:
+        """计算双方观点收敛度（简化版相似度）。"""
+        # 基于共同关键词的简单计算
+        def get_keywords(text: str) -> set:
+            words = re.findall(r"[\u4e00-\u9fff]{2,4}", text)
+            return set(words)
+
+        p_kw = get_keywords(p_text)
+        d_kw = get_keywords(d_text)
+        if not p_kw or not d_kw:
+            return 0.0
+
+        intersection = len(p_kw & d_kw)
+        union = len(p_kw | d_kw)
+        return round((intersection / union) * 100, 2) if union > 0 else 0.0
+
+    async def _generate_final_verdict(self, case: str, rounds: list[AgentDebateRound]) -> dict:
+        """生成最终判决。"""
+        debate_summary = "\n".join(
+            f"第{r.round_num}轮：\n【原告】{r.plaintiff_statement[:200]}...\n【被告】{r.defendant_statement[:200]}..."
+            for r in rounds
+        )
+
+        prompt = f"""
+请作为法官，根据以下案件和多轮辩论，给出最终判决意见。
+
+【案件事实】
+{case}
+
+【辩论过程】
+{debate_summary}
+
+【判决要求】
+1. 判定胜诉方（原告/被告/部分支持）
+2. 给出原告胜率和被告胜率（百分比）
+3. 列出3-5个关键胜负点
+4. 说明判决理由
+5. 给出行动建议
+
+请以JSON格式输出：
+{{
+    "winner": "原告/被告/部分支持",
+    "plaintiff_win_rate": 数字,
+    "defendant_win_rate": 数字,
+    "key_points": ["要点1", "要点2"],
+    "reasoning": "判决理由",
+    "action_suggestions": ["建议1", "建议2"]
+}}
+""".strip()
+
+        try:
+            result = await self.llm_gateway.chat_text(
+                user_message=prompt,
+                system_message="你是一位公正的法官，基于事实和法律做出判决。",
+                max_tokens=600,
+                temperature=0.3,
+            )
+            # 简单解析JSON
+            import json as _json
+            try:
+                return _json.loads(result)
+            except _json.JSONDecodeError:
+                return {
+                    "winner": "待裁定",
+                    "plaintiff_win_rate": 50,
+                    "defendant_win_rate": 50,
+                    "key_points": ["需进一步审理"],
+                    "reasoning": result[:300],
+                    "action_suggestions": ["补充证据后再审"],
+                }
+        except LLMGatewayError:
+            return {
+                "winner": "待裁定",
+                "plaintiff_win_rate": 50,
+                "defendant_win_rate": 50,
+                "key_points": ["辩论已完成", "需法官最终裁决"],
+                "reasoning": "双方已完成多轮辩论，等待法官最终判决。",
+                "action_suggestions": ["提交合议庭审议"],
+            }
+
+
+# 全局实例
+enhanced_debate = EnhancedMultiAgentDebate()
 
 
 if __name__ == "__main__":

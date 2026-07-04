@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import sys
 from pathlib import Path
 
@@ -12,17 +13,183 @@ if str(ROOT) not in sys.path:
 from frontend.api_client import APIClientError, LvsheAPIClient
 
 
+# ========== 背景图片相关函数 ==========
+BG_DIR = Path(__file__).resolve().parent / "assets" / "backgrounds"
+
+
+def get_background_images() -> list[Path]:
+    """获取背景图片列表。"""
+    if not BG_DIR.exists():
+        return []
+    supported = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+    images = sorted(
+        [f for f in BG_DIR.iterdir() if f.suffix.lower() in supported],
+        key=lambda x: x.stem,
+    )
+    return images[:9]  # 最多9张
+
+
+def image_to_base64(image_path: Path) -> str:
+    """将图片转换为 base64。"""
+    with open(image_path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    ext = image_path.suffix.lower().lstrip(".")
+    if ext == "jpg":
+        ext = "jpeg"
+    return f"data:image/{ext};base64,{data}"
+
+
+def apply_background_style(
+    enabled: bool,
+    blur_enabled: bool,
+    slideshow_enabled: bool,
+    interval: int = 5,
+):
+    """应用背景样式。"""
+    images = get_background_images()
+
+    if not enabled or not images:
+        # 清除背景
+        st.markdown(
+            """
+            <style>
+            .stApp {
+                background: none;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    # 生成 base64 图片列表
+    bg_images = [image_to_base64(img) for img in images]
+
+    # 虚化强度
+    blur_amount = "10px" if blur_enabled else "0px"
+
+    if len(bg_images) == 1 or not slideshow_enabled:
+        # 单张背景
+        css = f"""
+        <style>
+        .stApp {{
+            background-image: url("{bg_images[0]}");
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-attachment: fixed;
+        }}
+        .stApp::before {{
+            content: "";
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            backdrop-filter: blur({blur_amount});
+            -webkit-backdrop-filter: blur({blur_amount});
+            z-index: 0;
+            pointer-events: none;
+        }}
+        .stApp > div {{
+            position: relative;
+            z-index: 1;
+        }}
+        /* 主内容区半透明背景，提升可读性 */
+        .main .block-container {{
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(5px);
+            border-radius: 10px;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            padding: 2rem;
+        }}
+        </style>
+        """
+    else:
+        # 多张图片轮播 - 使用 CSS 动画
+        duration = len(bg_images) * interval
+        keyframes = ""
+        for i, img in enumerate(bg_images):
+            pct = (i / len(bg_images)) * 100
+            keyframes += f"    {pct:.0f}% {{ background-image: url('{img}'); }}\n"
+
+        css = f"""
+        <style>
+        .stApp {{
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            background-attachment: fixed;
+            animation: bgSlideshow {duration}s infinite;
+        }}
+        @keyframes bgSlideshow {{
+        {keyframes}
+            100% {{ background-image: url('{bg_images[0]}'); }}
+        }}
+        .stApp::before {{
+            content: "";
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            backdrop-filter: blur({blur_amount});
+            -webkit-backdrop-filter: blur({blur_amount});
+            z-index: 0;
+            pointer-events: none;
+        }}
+        .stApp > div {{
+            position: relative;
+            z-index: 1;
+        }}
+        /* 主内容区半透明背景，提升可读性 */
+        .main .block-container {{
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(5px);
+            border-radius: 10px;
+            margin-top: 1rem;
+            margin-bottom: 1rem;
+            padding: 2rem;
+        }}
+        </style>
+        """
+
+    st.markdown(css, unsafe_allow_html=True)
+
+
 st.set_page_config(
     page_title="律社复刻 - 法律 AI Agent",
     page_icon="⚖️",
     layout="wide",
 )
 
-st.title("⚖️ 律社复刻：法律 AI Agent 系统")
-st.caption("FastAPI + Streamlit + LiteLLM + LangGraph + ChromaDB + Agent Skills + Memory + Playwright + Multi-Agent")
-
 # ========== 侧边栏设置 ==========
 with st.sidebar:
+    st.header("⚙️ 显示设置")
+
+    bg_enabled = st.toggle("启用背景图片", value=False, key="bg_enabled")
+    bg_blur = st.toggle("背景虚化效果", value=True, key="bg_blur", disabled=not bg_enabled)
+    bg_slideshow = st.toggle("循环轮播背景", value=True, key="bg_slideshow", disabled=not bg_enabled)
+    bg_interval = st.slider(
+        "轮播间隔（秒）",
+        min_value=3,
+        max_value=30,
+        value=8,
+        step=1,
+        key="bg_interval",
+        disabled=not bg_enabled or not bg_slideshow,
+    )
+
+    bg_images = get_background_images()
+    if bg_enabled:
+        if bg_images:
+            st.caption(f"📷 已检测到 {len(bg_images)} 张背景图片")
+        else:
+            st.warning("⚠️ 未检测到背景图片")
+            st.caption("请将图片放入 `frontend/assets/backgrounds/` 目录")
+
+    st.divider()
     st.header("后端设置")
     api_base_url = st.text_input(
         "FastAPI 地址",
@@ -30,7 +197,18 @@ with st.sidebar:
     )
     st.info("请先启动后端：uv run uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000")
 
+# 应用背景样式
+apply_background_style(
+    enabled=bg_enabled,
+    blur_enabled=bg_blur,
+    slideshow_enabled=bg_slideshow,
+    interval=bg_interval,
+)
+
 client = LvsheAPIClient(base_url=api_base_url)
+
+st.title("⚖️ 律社复刻：法律 AI Agent 系统")
+st.caption("FastAPI + Streamlit + LiteLLM + LangGraph + ChromaDB + Agent Skills + Memory + Playwright + Multi-Agent")
 
 # ========== 案情类型选择区 ==========
 st.divider()
