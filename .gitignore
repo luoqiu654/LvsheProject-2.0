@@ -35,3 +35,15 @@ Thumbs.db
 
 # GUI Agent artifacts
 data/gui_agent/
+
+# 运行时数据（向量库、记忆、上传文件等）
+data/vector_store/
+data/image_vector_store/
+data/memory/
+
+# pytest 缓存
+pytest-of-*/
+.pytest-of-*/
+
+# 临时测试脚本
+test_imports.py
