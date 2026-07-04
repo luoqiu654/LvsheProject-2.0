@@ -1,0 +1,20 @@
+[
+  {
+    "id": "3cfdb362-c9d6-4a69-a254-95a352ce8f61",
+    "user_id": "user_a",
+    "content": "用户A关注租赁合同。",
+    "category": "general",
+    "source": "local",
+    "metadata": {},
+    "created_at": "2026-07-01T11:44:37.571413+00:00"
+  },
+  {
+    "id": "02275f46-8b71-46c9-8958-d990ab8c13ae",
+    "user_id": "user_b",
+    "content": "用户B关注劳动合同。",
+    "category": "general",
+    "source": "local",
+    "metadata": {},
+    "created_at": "2026-07-01T11:44:37.571984+00:00"
+  }
+]

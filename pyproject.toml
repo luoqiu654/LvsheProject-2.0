@@ -1,0 +1,43 @@
+[project]
+name = "lvsheproject"
+version = "0.1.0"
+description = "法律AI平台复刻 - 红岩网校Agent方向考核项目"
+readme = "README.md"
+requires-python = ">=3.14"
+packages = ["backend"]
+dependencies = [
+    "chromadb>=1.5.9",
+    "fastapi>=0.136.3",
+    "langgraph>=1.2.5",
+    "litellm>=1.89.0",
+    "mem0ai>=2.0.6",
+    "pdfplumber>=0.11.10",
+    "playwright>=1.60.0",
+    "pydantic-settings>=2.14.1",
+    "python-docx>=1.2.0",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "streamlit>=1.58.0",
+    "uvicorn[standard]>=0.49.0",
+    # ===== 新增：图像RAG =====
+    "pillow>=10.0.0",
+    "open-clip-torch>=2.20.0",
+    "torch>=2.0.0",
+    # ===== 新增：Graph RAG (Neo4j) =====
+    "neo4j>=5.0.0",
+    "langchain-neo4j>=0.2.0",
+    # ===== 新增：文档解析升级 =====
+    "unstructured[docx,pdf]>=0.15.0",
+    "unstructured-inference>=0.8.0",
+    "minio>=7.2.0",
+    # ===== 新增：相似度计算 =====
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.0",
+]

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# uv / virtual env
+.venv/
+.python-version
+
+# env secrets
+.env
+.env.*
+!.env.example
+
+# cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# data
+data/vector_store/
+data/uploads/*
+!data/uploads/.gitkeep
+
+# logs
+*.log
+logs/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# GUI Agent artifacts
+data/gui_agent/
