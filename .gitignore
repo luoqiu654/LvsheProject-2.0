@@ -47,3 +47,10 @@ pytest-of-*/
 
 # 临时测试脚本
 test_imports.py
+tmp_*.py
+
+# 前端自定义资源（保留 README 说明文件）
+frontend/assets/backgrounds/*
+!frontend/assets/backgrounds/README.md
+frontend/assets/music/*
+!frontend/assets/music/README.md
