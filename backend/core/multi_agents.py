@@ -142,6 +142,15 @@ class JudgeDecision:
 
 
 @dataclass
+class EvidenceItem:
+    """本案所需的关键证据项（法官主动梳理）。"""
+
+    name: str              # 证据名称
+    why_key: str            # 为何关键
+    target_party: str       # 向谁确认：plaintiff / defendant / user
+
+
+@dataclass
 class Verdict:
     """法官判决（结构化）。"""
 
@@ -556,6 +565,111 @@ class CourtSimulator:
         )
         return question, context
 
+    # ========== 证据梳理（法官主动）==========
+
+    def _evidence_inquiry_prompt(
+        self,
+        case: str,
+        opening: str,
+        rounds_so_far: list[TrialRound],
+    ) -> str:
+        """构造证据梳理 prompt，要求 LLM 输出 JSON 证据清单。"""
+        history = self._format_debate_history(rounds_so_far) if rounds_so_far else "暂无（开庭阶段）"
+        return (
+            f"你是中立法官，正在梳理本案做出判决所必需的关键证据清单。\n\n"
+            f"案件描述：\n{case[:800]}\n\n"
+            f"审判长开场白：\n{opening[:500]}\n\n"
+            f"已有辩论：\n{history[:400]}\n\n"
+            f"请列出本案做出判决所必需的关键证据清单（3-5 项），"
+            f"用于向原被告双方或当事人（用户）确认是否能提供。\n\n"
+            f"请严格按以下 JSON 格式输出（不要输出其他文字、不要 markdown 代码块）：\n"
+            f'{{\n'
+            f'  "evidence": [\n'
+            f'    {{\n'
+            f'      "name": "证据名称",\n'
+            f'      "why_key": "为何关键（简短说明）",\n'
+            f'      "target_party": "plaintiff" 或 "defendant" 或 "user"\n'
+            f'    }}\n'
+            f'  ]\n'
+            f'}}'
+        )
+
+    def _parse_evidence_list(self, text: str) -> list[EvidenceItem]:
+        """从 LLM 返回的 JSON 文本中解析证据清单。"""
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
+            raw = re.sub(r"```$", "", raw).strip()
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return []
+        items: list[EvidenceItem] = []
+        for ev in data.get("evidence", []):
+            if not isinstance(ev, dict):
+                continue
+            name = str(ev.get("name", "")).strip()
+            if not name:
+                continue
+            target = str(ev.get("target_party", "user")).lower()
+            if target not in ("plaintiff", "defendant", "user"):
+                target = "user"
+            items.append(EvidenceItem(
+                name=name,
+                why_key=str(ev.get("why_key", "")),
+                target_party=target,
+            ))
+        return items
+
+    async def _gen_evidence_inquiry(
+        self,
+        case: str,
+        opening: str,
+        rounds_so_far: list[TrialRound],
+    ) -> list[EvidenceItem]:
+        """非流式生成证据梳理清单，返回 EvidenceItem 列表。"""
+        try:
+            response = await self.gateway.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_JUDGE},
+                    {"role": "user", "content": self._evidence_inquiry_prompt(
+                        case, opening, rounds_so_far,
+                    )},
+                ],
+                model=MODEL_DECISION,
+                temperature=0.3,
+                max_tokens=800,
+            )
+            text = self.gateway.extract_text(response)
+            # content 为空时回退用 reasoning
+            if not text:
+                text = self.gateway.extract_reasoning(response)
+            return self._parse_evidence_list(text)
+        except Exception:
+            return []
+
+    @staticmethod
+    def _format_evidence_speech(items: list[EvidenceItem]) -> str:
+        """将证据清单格式化为法官发言文本（speech 卡片展示）。"""
+        if not items:
+            return ""
+        lines = ["## 法官证据梳理\n"]
+        lines.append("经审查，本案做出判决需确认以下关键证据：\n")
+        for i, ev in enumerate(items, 1):
+            target_label = {
+                "plaintiff": "原告方",
+                "defendant": "被告方",
+                "user": "当事人（您）",
+            }.get(ev.target_party, "当事人")
+            lines.append(f"{i}. **{ev.name}**（向{target_label}确认）")
+            if ev.why_key:
+                lines.append(f"   - 为何关键：{ev.why_key}")
+        lines.append("\n请相关方就上述证据是否能提供做出说明。")
+        return "\n".join(lines)
+
     # ========== 流式发言（含 reasoning）==========
 
     async def _stream_role_speech(
@@ -575,7 +689,11 @@ class CourtSimulator:
         - reasoning_content → ``thinking`` 事件（前端折叠展示）
         - content → ``speech`` 事件（正式发言）
         - 最后 yield ``speech_end`` 标记发言结束
+        - 流式结束后若 content 累积为空但 reasoning 非空，
+          回退用 reasoning 作为 speech 内容，保证发言卡片非空
         """
+        content_acc = ""
+        reasoning_acc = ""
         try:
             async for typ, text in self.gateway.chat_stream_with_reasoning(
                 messages=messages,
@@ -584,6 +702,7 @@ class CourtSimulator:
                 max_tokens=max_tokens,
             ):
                 if typ == "reasoning":
+                    reasoning_acc += text
                     yield {
                         "type": "thinking",
                         "role": role,
@@ -591,6 +710,7 @@ class CourtSimulator:
                         "round": round_num,
                     }
                 else:  # content
+                    content_acc += text
                     yield {
                         "type": "speech",
                         "role": role,
@@ -607,6 +727,16 @@ class CourtSimulator:
                     "kind": kind,
                     "round": round_num,
                 }
+                content_acc += fallback_text
+        # 流式结束后若 content 累积为空但 reasoning 非空，回退用 reasoning 作为发言
+        if not content_acc and reasoning_acc:
+            yield {
+                "type": "speech",
+                "role": role,
+                "text": reasoning_acc,
+                "kind": kind,
+                "round": round_num,
+            }
         yield {
             "type": "speech_end",
             "role": role,
@@ -721,7 +851,7 @@ class CourtSimulator:
             if decision.should_ask and not decision.question.strip():
                 decision.should_ask = False
             return decision
-        except LLMGatewayError:
+        except Exception:
             return JudgeDecision(should_ask=False)
 
     async def _gen_plaintiff_answer(
@@ -745,7 +875,7 @@ class CourtSimulator:
                 temperature=0.5,
                 max_tokens=700,
             )
-        except LLMGatewayError:
+        except Exception:
             return "（原告暂无回应，LLM 不可用）"
 
     async def _gen_defendant_answer(
@@ -769,7 +899,7 @@ class CourtSimulator:
                 temperature=0.5,
                 max_tokens=700,
             )
-        except LLMGatewayError:
+        except Exception:
             return "（被告暂无回应，LLM 不可用）"
 
     async def _gen_verdict_structured(
@@ -794,9 +924,16 @@ class CourtSimulator:
             )
             reasoning = self.gateway.extract_reasoning(response)
             text = self.gateway.extract_text(response)
+            # 判决回退例外：当 content 为空时，从 reasoning 提取判决内容
+            # （_parse_verdict 已支持正则提取 {...}）
+            if not text and reasoning:
+                text = reasoning
             verdict = self._parse_verdict(text, case)
             if not verdict.full_text:
-                verdict.full_text = text
+                verdict.full_text = text or reasoning
+            # 确保 VerdictPanel 拿到真实内容（非空）
+            if not verdict.full_text:
+                verdict.full_text = self._fallback_verdict(case).full_text
             return verdict, reasoning
         except LLMGatewayError:
             return self._fallback_verdict(case), ""
@@ -1056,6 +1193,90 @@ class CourtSimulator:
                     opening += ev["text"]
             speeches.append(SpeechRecord(ROLE_CHIEF_JUDGE, opening, 0, now))
 
+            # 1.5 法官证据梳理（opening 之后、第一轮辩论前）
+            evidence_user_answer = ""
+            yield {
+                "type": "thinking_note",
+                "role": ROLE_JUDGE,
+                "text": "法官正在梳理本案所需的关键证据清单...",
+                "round": 0,
+            }
+            evidence_items = await self._gen_evidence_inquiry(
+                case_description, opening, trial_rounds,
+            )
+            if evidence_items:
+                yield {
+                    "type": "evidence_list",
+                    "items": [
+                        {
+                            "name": e.name,
+                            "why_key": e.why_key,
+                            "target_party": e.target_party,
+                        }
+                        for e in evidence_items
+                    ],
+                    "round": 0,
+                }
+                evidence_text = self._format_evidence_speech(evidence_items)
+                if evidence_text:
+                    yield {
+                        "type": "speech",
+                        "role": ROLE_JUDGE,
+                        "text": evidence_text,
+                        "kind": KIND_INQUIRY,
+                        "round": 0,
+                    }
+                    yield {
+                        "type": "speech_end",
+                        "role": ROLE_JUDGE,
+                        "kind": KIND_INQUIRY,
+                        "round": 0,
+                    }
+                    speeches.append(SpeechRecord(
+                        ROLE_JUDGE, evidence_text, 0, self._now(),
+                    ))
+                # 对每项 target_party="user" 的证据，向用户针对性追问
+                user_evidence_answers: list[str] = []
+                for idx, ev in enumerate(evidence_items):
+                    if ev.target_party != "user" or answer_callback is None:
+                        continue
+                    question_id = f"ev_{idx}"
+                    ev_q = (
+                        f"法官要求您确认证据：{ev.name}\n"
+                        f"为何关键：{ev.why_key}\n"
+                        f"您是否持有该证据？如有，请说明证据内容。"
+                    )
+                    ev_ctx = (
+                        f"该证据（{ev.name}）对本案判决有重大影响，"
+                        f"需当事人（您）确认是否持有。"
+                        f"若您不持有或不清楚，请明确说明。"
+                    )
+                    yield {
+                        "type": "user_question",
+                        "question_id": question_id,
+                        "question": ev_q,
+                        "context": ev_ctx,
+                        "evidence_name": ev.name,
+                        "round": 0,
+                    }
+                    try:
+                        ev_ans = await answer_callback(question_id, ev_q, ev_ctx)
+                    except Exception as exc:
+                        ev_ans = f"（用户回答失败：{exc}）"
+                    if not isinstance(ev_ans, str):
+                        ev_ans = str(ev_ans)
+                    yield {
+                        "type": "user_answer",
+                        "question_id": question_id,
+                        "answer": ev_ans,
+                        "round": 0,
+                    }
+                    if self._is_user_unknown(ev_ans):
+                        user_said_unknown = True
+                    user_evidence_answers.append(f"【证据：{ev.name}】{ev_ans}")
+                if user_evidence_answers:
+                    evidence_user_answer = "\n\n".join(user_evidence_answers)
+
             # 2. 多轮辩论
             for rn in range(1, rounds + 1):
                 p_speech = ""
@@ -1064,202 +1285,214 @@ class CourtSimulator:
                 p_answer = ""
                 d_answer = ""
                 user_answer = ""
+                try:
+                    # a. 原告陈述（流式 + reasoning）
+                    p_msgs = [
+                        {"role": "system", "content": SYSTEM_PLAINTIFF},
+                        {"role": "user", "content": self._plaintiff_prompt(
+                            case_description, opening, rn, trial_rounds,
+                        )},
+                    ]
+                    async for ev in self._stream_role_speech(
+                        p_msgs, ROLE_PLAINTIFF, KIND_STATEMENT, MODEL_SPEECH, rn,
+                        temperature=0.6, max_tokens=1000,
+                        fallback_text=self._fallback_speech("plaintiff", case_description, rn),
+                    ):
+                        yield ev
+                        if ev["type"] == "speech":
+                            p_speech += ev["text"]
+                    speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_speech, rn, self._now()))
 
-                # a. 原告陈述（流式 + reasoning）
-                p_msgs = [
-                    {"role": "system", "content": SYSTEM_PLAINTIFF},
-                    {"role": "user", "content": self._plaintiff_prompt(
-                        case_description, opening, rn, trial_rounds,
-                    )},
-                ]
-                async for ev in self._stream_role_speech(
-                    p_msgs, ROLE_PLAINTIFF, KIND_STATEMENT, MODEL_SPEECH, rn,
-                    temperature=0.6, max_tokens=1000,
-                    fallback_text=self._fallback_speech("plaintiff", case_description, rn),
-                ):
-                    yield ev
-                    if ev["type"] == "speech":
-                        p_speech += ev["text"]
-                speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_speech, rn, self._now()))
+                    # b. 被告答辩（流式 + reasoning）
+                    d_msgs = [
+                        {"role": "system", "content": SYSTEM_DEFENDANT},
+                        {"role": "user", "content": self._defendant_prompt(
+                            case_description, opening, rn, trial_rounds, p_speech,
+                        )},
+                    ]
+                    async for ev in self._stream_role_speech(
+                        d_msgs, ROLE_DEFENDANT, KIND_STATEMENT, MODEL_SPEECH, rn,
+                        temperature=0.6, max_tokens=1000,
+                        fallback_text=self._fallback_speech("defendant", case_description, rn),
+                    ):
+                        yield ev
+                        if ev["type"] == "speech":
+                            d_speech += ev["text"]
+                    speeches.append(SpeechRecord(ROLE_DEFENDANT, d_speech, rn, self._now()))
 
-                # b. 被告答辩（流式 + reasoning）
-                d_msgs = [
-                    {"role": "system", "content": SYSTEM_DEFENDANT},
-                    {"role": "user", "content": self._defendant_prompt(
-                        case_description, opening, rn, trial_rounds, p_speech,
-                    )},
-                ]
-                async for ev in self._stream_role_speech(
-                    d_msgs, ROLE_DEFENDANT, KIND_STATEMENT, MODEL_SPEECH, rn,
-                    temperature=0.6, max_tokens=1000,
-                    fallback_text=self._fallback_speech("defendant", case_description, rn),
-                ):
-                    yield ev
-                    if ev["type"] == "speech":
-                        d_speech += ev["text"]
-                speeches.append(SpeechRecord(ROLE_DEFENDANT, d_speech, rn, self._now()))
-
-                # c. 法官追问决策（非流式 JSON）
-                yield {
-                    "type": "thinking",
-                    "role": ROLE_JUDGE,
-                    "text": f"法官正在审查第 {rn} 轮辩论，判断是否需要追问...",
-                    "round": rn,
-                }
-                decision = await self._gen_judge_decision(
-                    case_description, opening, rn, trial_rounds, p_speech, d_speech,
-                )
-
-                if decision.should_ask and decision.question:
-                    j_inquiry = decision.question
-                    target = decision.target
-                    target_label = {
-                        "plaintiff": "原告", "defendant": "被告", "both": "原被告双方",
-                    }.get(target, "双方")
-
-                    # d. 法官追问（已由决策 LLM 生成，一次性发出）
+                    # c. 法官追问决策（非流式 JSON）
                     yield {
-                        "type": "speech",
+                        "type": "thinking_note",
                         "role": ROLE_JUDGE,
-                        "text": j_inquiry,
-                        "kind": KIND_INQUIRY,
+                        "text": f"法官正在审查第 {rn} 轮辩论，判断是否需要追问...",
                         "round": rn,
                     }
-                    yield {
-                        "type": "speech_end",
-                        "role": ROLE_JUDGE,
-                        "kind": KIND_INQUIRY,
-                        "round": rn,
-                    }
-                    speeches.append(SpeechRecord(ROLE_JUDGE, j_inquiry, rn, self._now()))
+                    decision = await self._gen_judge_decision(
+                        case_description, opening, rn, trial_rounds, p_speech, d_speech,
+                    )
 
-                    # 原告回答法官
-                    if target in ("plaintiff", "both"):
+                    if decision.should_ask and decision.question:
+                        j_inquiry = decision.question
+                        target = decision.target
+                        target_label = {
+                            "plaintiff": "原告", "defendant": "被告", "both": "原被告双方",
+                        }.get(target, "双方")
+
+                        # d. 法官追问（已由决策 LLM 生成，一次性发出）
                         yield {
-                            "type": "thinking",
-                            "role": ROLE_PLAINTIFF,
-                            "text": f"原告正在针对法官追问（对象：{target_label}）组织回答...",
+                            "type": "speech",
+                            "role": ROLE_JUDGE,
+                            "text": j_inquiry,
+                            "kind": KIND_INQUIRY,
                             "round": rn,
                         }
-                        pa_msgs = [
-                            {"role": "system", "content": SYSTEM_PLAINTIFF},
-                            {"role": "user", "content": self._plaintiff_answer_prompt(
-                                case_description, opening, rn, trial_rounds,
-                                p_speech, d_speech, j_inquiry,
-                            )},
-                        ]
-                        async for ev in self._stream_role_speech(
-                            pa_msgs, ROLE_PLAINTIFF, KIND_ANSWER, MODEL_SPEECH, rn,
-                            temperature=0.5, max_tokens=700,
-                            fallback_text="（原告暂无回应）",
-                        ):
-                            yield ev
-                            if ev["type"] == "speech":
-                                p_answer += ev["text"]
-                        speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_answer, rn, self._now()))
-
-                        # 证据检查：原告回答含"不清楚" → 向用户询问
-                        if self._needs_user_input(p_answer) and answer_callback is not None:
-                            question_id = f"q{rn}_plaintiff"
-                            ev_q, ev_ctx = self._build_user_question(
-                                "plaintiff", p_answer, j_inquiry, rn,
-                            )
-                            yield {
-                                "type": "user_question",
-                                "question_id": question_id,
-                                "question": ev_q,
-                                "context": ev_ctx,
-                                "round": rn,
-                            }
-                            try:
-                                u_ans = await answer_callback(question_id, ev_q, ev_ctx)
-                            except Exception as exc:
-                                u_ans = f"（用户回答失败：{exc}）"
-                            if not isinstance(u_ans, str):
-                                u_ans = str(u_ans)
-                            yield {
-                                "type": "user_answer",
-                                "question_id": question_id,
-                                "answer": u_ans,
-                                "round": rn,
-                            }
-                            if self._is_user_unknown(u_ans):
-                                user_said_unknown = True
-                            user_answer = u_ans
-
-                    # 被告回答法官
-                    if target in ("defendant", "both"):
                         yield {
-                            "type": "thinking",
-                            "role": ROLE_DEFENDANT,
-                            "text": f"被告正在针对法官追问（对象：{target_label}）组织回答...",
+                            "type": "speech_end",
+                            "role": ROLE_JUDGE,
+                            "kind": KIND_INQUIRY,
                             "round": rn,
                         }
-                        da_msgs = [
-                            {"role": "system", "content": SYSTEM_DEFENDANT},
-                            {"role": "user", "content": self._defendant_answer_prompt(
-                                case_description, opening, rn, trial_rounds,
-                                p_speech, d_speech, j_inquiry,
-                            )},
-                        ]
-                        async for ev in self._stream_role_speech(
-                            da_msgs, ROLE_DEFENDANT, KIND_ANSWER, MODEL_SPEECH, rn,
-                            temperature=0.5, max_tokens=700,
-                            fallback_text="（被告暂无回应）",
-                        ):
-                            yield ev
-                            if ev["type"] == "speech":
-                                d_answer += ev["text"]
-                        speeches.append(SpeechRecord(ROLE_DEFENDANT, d_answer, rn, self._now()))
+                        speeches.append(SpeechRecord(ROLE_JUDGE, j_inquiry, rn, self._now()))
 
-                        # 证据检查：被告回答含"不清楚" → 向用户询问
-                        if self._needs_user_input(d_answer) and answer_callback is not None:
-                            question_id = f"q{rn}_defendant"
-                            ev_q, ev_ctx = self._build_user_question(
-                                "defendant", d_answer, j_inquiry, rn,
-                            )
+                        # 原告回答法官
+                        if target in ("plaintiff", "both"):
                             yield {
-                                "type": "user_question",
-                                "question_id": question_id,
-                                "question": ev_q,
-                                "context": ev_ctx,
+                                "type": "thinking_note",
+                                "role": ROLE_PLAINTIFF,
+                                "text": f"原告正在针对法官追问（对象：{target_label}）组织回答...",
                                 "round": rn,
                             }
-                            try:
-                                d_u_ans = await answer_callback(question_id, ev_q, ev_ctx)
-                            except Exception as exc:
-                                d_u_ans = f"（用户回答失败：{exc}）"
-                            if not isinstance(d_u_ans, str):
-                                d_u_ans = str(d_u_ans)
+                            pa_msgs = [
+                                {"role": "system", "content": SYSTEM_PLAINTIFF},
+                                {"role": "user", "content": self._plaintiff_answer_prompt(
+                                    case_description, opening, rn, trial_rounds,
+                                    p_speech, d_speech, j_inquiry,
+                                )},
+                            ]
+                            async for ev in self._stream_role_speech(
+                                pa_msgs, ROLE_PLAINTIFF, KIND_ANSWER, MODEL_SPEECH, rn,
+                                temperature=0.5, max_tokens=700,
+                                fallback_text="（原告暂无回应）",
+                            ):
+                                yield ev
+                                if ev["type"] == "speech":
+                                    p_answer += ev["text"]
+                            speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_answer, rn, self._now()))
+
+                            # 证据检查：原告回答含"不清楚" → 向用户询问
+                            if self._needs_user_input(p_answer) and answer_callback is not None:
+                                question_id = f"q{rn}_plaintiff"
+                                ev_q, ev_ctx = self._build_user_question(
+                                    "plaintiff", p_answer, j_inquiry, rn,
+                                )
+                                yield {
+                                    "type": "user_question",
+                                    "question_id": question_id,
+                                    "question": ev_q,
+                                    "context": ev_ctx,
+                                    "round": rn,
+                                }
+                                try:
+                                    u_ans = await answer_callback(question_id, ev_q, ev_ctx)
+                                except Exception as exc:
+                                    u_ans = f"（用户回答失败：{exc}）"
+                                if not isinstance(u_ans, str):
+                                    u_ans = str(u_ans)
+                                yield {
+                                    "type": "user_answer",
+                                    "question_id": question_id,
+                                    "answer": u_ans,
+                                    "round": rn,
+                                }
+                                if self._is_user_unknown(u_ans):
+                                    user_said_unknown = True
+                                user_answer = u_ans
+
+                        # 被告回答法官
+                        if target in ("defendant", "both"):
                             yield {
-                                "type": "user_answer",
-                                "question_id": question_id,
-                                "answer": d_u_ans,
+                                "type": "thinking_note",
+                                "role": ROLE_DEFENDANT,
+                                "text": f"被告正在针对法官追问（对象：{target_label}）组织回答...",
                                 "round": rn,
                             }
-                            if self._is_user_unknown(d_u_ans):
-                                user_said_unknown = True
-                            if user_answer:
-                                user_answer += f"\n（被告方追问）{d_u_ans}"
-                            else:
-                                user_answer = d_u_ans
-                else:
-                    # 法官决定不追问
+                            da_msgs = [
+                                {"role": "system", "content": SYSTEM_DEFENDANT},
+                                {"role": "user", "content": self._defendant_answer_prompt(
+                                    case_description, opening, rn, trial_rounds,
+                                    p_speech, d_speech, j_inquiry,
+                                )},
+                            ]
+                            async for ev in self._stream_role_speech(
+                                da_msgs, ROLE_DEFENDANT, KIND_ANSWER, MODEL_SPEECH, rn,
+                                temperature=0.5, max_tokens=700,
+                                fallback_text="（被告暂无回应）",
+                            ):
+                                yield ev
+                                if ev["type"] == "speech":
+                                    d_answer += ev["text"]
+                            speeches.append(SpeechRecord(ROLE_DEFENDANT, d_answer, rn, self._now()))
+
+                            # 证据检查：被告回答含"不清楚" → 向用户询问
+                            if self._needs_user_input(d_answer) and answer_callback is not None:
+                                question_id = f"q{rn}_defendant"
+                                ev_q, ev_ctx = self._build_user_question(
+                                    "defendant", d_answer, j_inquiry, rn,
+                                )
+                                yield {
+                                    "type": "user_question",
+                                    "question_id": question_id,
+                                    "question": ev_q,
+                                    "context": ev_ctx,
+                                    "round": rn,
+                                }
+                                try:
+                                    d_u_ans = await answer_callback(question_id, ev_q, ev_ctx)
+                                except Exception as exc:
+                                    d_u_ans = f"（用户回答失败：{exc}）"
+                                if not isinstance(d_u_ans, str):
+                                    d_u_ans = str(d_u_ans)
+                                yield {
+                                    "type": "user_answer",
+                                    "question_id": question_id,
+                                    "answer": d_u_ans,
+                                    "round": rn,
+                                }
+                                if self._is_user_unknown(d_u_ans):
+                                    user_said_unknown = True
+                                if user_answer:
+                                    user_answer += f"\n（被告方追问）{d_u_ans}"
+                                else:
+                                    user_answer = d_u_ans
+                    else:
+                        # 法官决定不追问
+                        yield {
+                            "type": "thinking_note",
+                            "role": ROLE_JUDGE,
+                            "text": f"法官审查后认为第 {rn} 轮辩论无需追问，进入下一环节。",
+                            "round": rn,
+                        }
+                except Exception as exc:
                     yield {
-                        "type": "thinking",
-                        "role": ROLE_JUDGE,
-                        "text": f"法官审查后认为第 {rn} 轮辩论无需追问，进入下一环节。",
+                        "type": "error",
+                        "message": f"第 {rn} 轮辩论出错：{exc}（已跳过，继续下一轮）",
                         "round": rn,
                     }
-
+                # 注入证据梳理阶段的用户回答到第 1 轮
+                round_user_answer = user_answer
+                if rn == 1 and evidence_user_answer:
+                    round_user_answer = (
+                        evidence_user_answer
+                        + (f"\n\n{user_answer}" if user_answer else "")
+                    )
                 trial_rounds.append(TrialRound(
-                    rn, p_speech, d_speech, j_inquiry, p_answer, d_answer, user_answer,
+                    rn, p_speech, d_speech, j_inquiry, p_answer, d_answer, round_user_answer,
                 ))
                 yield {"type": "round_end", "round": rn}
 
             # 3. 最终判决（非流式，提取 reasoning）
             yield {
-                "type": "thinking",
+                "type": "thinking_note",
                 "role": ROLE_JUDGE,
                 "text": "法官正在综合所有辩论和证据，撰写判决书...",
                 "round": rounds + 1,

@@ -16,7 +16,8 @@ export async function getModels(): Promise<ModelsInfo> {
 
 // SSE 流式多轮对话
 // onChunk: 每收到一个文本片段回调
-// onThinking: 收到思考过程片段回调（如"分析用户输入..."、"检索法律知识库..."）
+// onThinking: 收到编排步骤回调（如"分析用户输入..."、"检索法律知识库..."，离散列表）
+// onReasoning: 收到 LLM reasoning_content 片段回调（模型思考过程，横向流式段落）
 // onImage: 收到后端生成的图片URL回调（GLM-Image 生成结果）
 // onDone: 流结束回调
 // onError: 出错回调
@@ -31,6 +32,7 @@ export async function streamMultiTurn(
   } & {
     onChunk: (text: string) => void
     onThinking?: (text: string) => void
+    onReasoning?: (text: string) => void
     onImage?: (imageUrl: string) => void
     onDone?: () => void
     onError?: (err: string) => void
@@ -85,6 +87,7 @@ export async function streamMultiTurn(
         try {
           const obj = JSON.parse(payload)
           if (obj.thinking) opts.onThinking?.(obj.thinking)
+          if (obj.reasoning) opts.onReasoning?.(obj.reasoning)
           if (obj.text) opts.onChunk(obj.text)
           if (obj.image) opts.onImage?.(obj.image)
           if (obj.error) opts.onError?.(obj.error)

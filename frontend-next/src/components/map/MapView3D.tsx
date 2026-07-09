@@ -63,6 +63,8 @@ interface MapView3DProps {
   onSelectLocation: (id: string | null) => void
   /** 当 nonce 变化时，飞行到 id 对应地点 */
   flyTarget: { id: string; nonce: number } | null
+  /** 当 nonce 变化时，绕当前视角旋转 180°（保持 3D 透视） */
+  rotateSignal?: { nonce: number }
   /** 初始视图（用于模式切换时保持中心/缩放），仅首次初始化生效 */
   initialView?: { center: [number, number]; zoom: number }
   /** 地图移动结束时回调，用于上报当前视图状态 */
@@ -78,6 +80,7 @@ export default function MapView3D({
   selectedLocationId,
   onSelectLocation,
   flyTarget,
+  rotateSignal,
   initialView,
   onViewChange,
 }: MapView3DProps) {
@@ -292,6 +295,33 @@ export default function MapView3D({
     // 仅依赖 nonce 变化触发
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flyTarget?.nonce])
+
+  // 外部触发 180° 3D 视角旋转（保持 3D 透视）
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !rotateSignal) return
+    // 初始 nonce=0 跳过（首次渲染）
+    if (rotateSignal.nonce === 0) return
+
+    const rotate = () => {
+      const nextBearing = (map.getBearing() + 180) % 360
+      map.rotateTo(nextBearing, { duration: 800 })
+      // 保持 3D 透视（pitch 上限 70，避免过度俯仰）
+      map.flyTo({
+        pitch: Math.min(map.getPitch(), 70),
+        duration: 800,
+        essential: true,
+      })
+    }
+
+    if (map.loaded()) {
+      rotate()
+    } else {
+      map.once('load', rotate)
+    }
+    // 仅依赖 nonce 变化触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rotateSignal?.nonce])
 
   return (
     <>

@@ -65,6 +65,8 @@ interface MapViewAmapProps {
   onSelectLocation: (id: string | null) => void
   /** 当 nonce 变化时，飞行到 id 对应地点 */
   flyTarget: { id: string; nonce: number } | null
+  /** 当 nonce 变化时，绕当前视角旋转 180°（高德 setRotation 支持 0-360 平滑过渡） */
+  rotateSignal?: { nonce: number }
   /** 初始视图（用于模式切换时保持中心/缩放），仅首次初始化生效 */
   initialView?: { center: [number, number]; zoom: number }
   /** 地图移动结束时回调，用于上报当前视图状态 */
@@ -81,6 +83,7 @@ export default function MapViewAmap({
   selectedLocationId,
   onSelectLocation,
   flyTarget,
+  rotateSignal,
   initialView,
   onViewChange,
 }: MapViewAmapProps) {
@@ -306,6 +309,26 @@ export default function MapViewAmap({
     // 仅依赖 nonce 变化触发
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flyTarget?.nonce, mapReady])
+
+  // 外部触发 180° 3D 视角旋转（高德 setRotation 支持 0-360 平滑过渡）
+  useEffect(() => {
+    if (!mapReady) return
+    const map = mapRef.current
+    if (!map || !rotateSignal) return
+    // 初始 nonce=0 跳过（首次渲染）
+    if (rotateSignal.nonce === 0) return
+
+    try {
+      const currentRotation = (map.getRotation() ?? 0) % 360
+      const nextRotation = (currentRotation + 180) % 360
+      // 高德 setRotation 第二参为是否动画过渡
+      map.setRotation(nextRotation, true)
+    } catch (err) {
+      console.warn('[MapViewAmap] rotate failed:', err)
+    }
+    // 仅依赖 nonce 变化触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rotateSignal?.nonce, mapReady])
 
   return (
     <>

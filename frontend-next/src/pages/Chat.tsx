@@ -87,8 +87,12 @@ export default function Chat() {
   const [visionAnalysis, setVisionAnalysis] = useState<Record<string, string>>(
     {},
   )
-  // AI 消息 ID -> 思考步骤列表（折叠展示）
+  // AI 消息 ID -> 思考步骤列表（编排步骤，离散列表展示）
   const [thinkingByMsg, setThinkingByMsg] = useState<Record<string, string[]>>(
+    {},
+  )
+  // AI 消息 ID -> LLM reasoning_content（模型思考过程，字符串累加，横向流式段落）
+  const [reasoningByMsg, setReasoningByMsg] = useState<Record<string, string>>(
     {},
   )
   // AI 消息 ID -> 生成的图片 URL 列表（GLM-Image 生成结果）
@@ -190,9 +194,19 @@ export default function Chat() {
           try {
             const result = await parseDocument(file)
             const text = result?.text || ""
-            const trimmed =
-              text.length > 8000 ? text.slice(0, 8000) + "\n...(内容已截断)" : text
-            updatePending(id, { status: "ready", content: trimmed })
+            // 后端视觉模型兜底后仍为空文本，标记错误
+            if (!text.trim()) {
+              updatePending(id, {
+                status: "error",
+                errorMessage: "未解析到文本内容",
+              })
+            } else {
+              const trimmed =
+                text.length > 8000
+                  ? text.slice(0, 8000) + "\n...(内容已截断)"
+                  : text
+              updatePending(id, { status: "ready", content: trimmed })
+            }
           } catch (e) {
             updatePending(id, {
               status: "error",
@@ -366,6 +380,13 @@ export default function Chat() {
           return { ...prev, [aiMsgId]: [...arr, t] }
         })
       },
+      onReasoning: (t) => {
+        // reasoning_content 字符串累加（横向流式段落，非离散列表）
+        setReasoningByMsg((prev) => ({
+          ...prev,
+          [aiMsgId]: (prev[aiMsgId] || "") + t,
+        }))
+      },
       onImage: (url) => {
         // 后端 GLM-Image 生成的图片 URL
         setGeneratedImages((prev) => ({
@@ -402,6 +423,7 @@ export default function Chat() {
     setStreaming,
     setPendingAttachments,
     setThinkingByMsg,
+    setReasoningByMsg,
     setGeneratedImages,
     renameConversation,
   ])
@@ -590,10 +612,12 @@ export default function Chat() {
                       </div>
                     ) : (
                       <div className="rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-sm ring-1 ring-gray-100">
-                        {/* 思考过程折叠面板 */}
-                        {thinkingByMsg[msg.id]?.length > 0 && (
+                        {/* 思考过程折叠面板：steps=编排步骤（离散列表），content=reasoning（流式段落） */}
+                        {(thinkingByMsg[msg.id]?.length > 0 ||
+                          !!reasoningByMsg[msg.id]) && (
                           <ThinkingPanel
                             steps={thinkingByMsg[msg.id]}
+                            content={reasoningByMsg[msg.id]}
                             active={
                               isStreaming &&
                               msg.id ===

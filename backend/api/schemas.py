@@ -143,6 +143,7 @@ class DocumentParseResponse(BaseAPIResponse):
     filename: str
     text: str
     char_count: int
+    parser_used: Optional[str] = None
 
 
 # ========== 合同审查相关 ==========

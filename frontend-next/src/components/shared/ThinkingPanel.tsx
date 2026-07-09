@@ -13,7 +13,7 @@ import { cn } from "@/lib/utils"
 //   1. AI 回复前的思考过程（步骤列表，蓝色基调）
 //   2. 用户消息下的 AI 视觉分析卡片（单段文本/children，紫色基调）
 interface ThinkingPanelProps {
-  // 思考步骤列表（列表形式展示）；与 content/children 二选一
+  // 思考步骤列表（离散列表形式展示）；与 content（段落）/children 并存渲染
   steps?: string[]
   // 单段文本内容（段落形式展示，如流式 reasoning_content）
   content?: string
@@ -65,8 +65,10 @@ export function ThinkingPanel({
   }, [thinking])
 
   const hasSteps = !!steps && steps.length > 0
-  const hasContent = hasSteps || !!content || !!children
-  if (!hasContent) return null
+  const hasContentText = !!content && content.length > 0
+  const hasChildren = !!children
+  const hasContent = hasSteps || hasContentText || hasChildren
+  if (!hasContent && !thinking) return null
 
   const Icon: LucideIcon = icon ?? (variant === "vision" ? Eye : Brain)
 
@@ -124,9 +126,10 @@ export function ThinkingPanel({
           className={cn(
             "border-t px-3 py-2 text-xs leading-relaxed text-gray-600",
             isVision ? "border-purple-100" : "border-blue-100",
+            hasSteps && hasContentText && "space-y-2",
           )}
         >
-          {hasSteps ? (
+          {hasSteps && (
             <ol className="space-y-1">
               {steps!.map((s, i) => (
                 <li key={i} className="flex gap-1.5">
@@ -142,11 +145,11 @@ export function ThinkingPanel({
                 </li>
               ))}
             </ol>
-          ) : content ? (
-            <p className="whitespace-pre-wrap break-words">{content}</p>
-          ) : (
-            children
           )}
+          {hasContentText && (
+            <p className="whitespace-pre-wrap break-words">{content}</p>
+          )}
+          {!hasSteps && !hasContentText && hasChildren && children}
         </div>
       )}
     </div>

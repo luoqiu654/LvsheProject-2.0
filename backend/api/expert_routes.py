@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from typing import Any
 
@@ -146,10 +147,16 @@ async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
     async def answer_callback(
         question_id: str, question: str, context: str,
     ) -> str:
-        """当法官触发证据询问时调用，阻塞等待用户通过 /answer 端点提交。"""
-        _set_trial_status(trial_id, "waiting_answer")
+        """当法官触发证据询问时调用，阻塞等待用户通过 /answer 端点提交。
+
+        状态已在 generate() 转发 user_question 事件前设置为 "waiting_answer"，
+        此处仅阻塞等待用户回答，并增加 5 分钟超时保护避免永久阻塞。
+        """
         try:
-            answer = await answer_queue.get()
+            # 超时保护：5 分钟无回答自动回退
+            answer = await asyncio.wait_for(answer_queue.get(), timeout=300)
+        except asyncio.TimeoutError:
+            return "（用户未在规定时间内回答）"
         finally:
             _set_trial_status(trial_id, "running")
         return answer
@@ -162,6 +169,13 @@ async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
                 answer_callback=answer_callback,
                 trial_id=trial_id,
             ):
+                # 在转发 user_question 事件前，先设置状态为 waiting_answer
+                # （消除竞态窗口：用户在状态切换前提交回答会被 /answer 拒绝）
+                if event.get("type") == "user_question":
+                    _set_trial_status(trial_id, "waiting_answer")
+                    state = _trials.get(trial_id)
+                    if state is not None:
+                        state["user_question_at"] = time.monotonic()
                 # 持久化 done 事件的结果
                 if event.get("type") == "done":
                     result = event.get("result")
@@ -205,6 +219,22 @@ async def submit_trial_answer(
             status_code=404,
             detail=f"庭审不存在或已结束：{trial_id}",
         )
+    # 竞态容错：若状态为 running 但距 user_question 时间 < 5s，
+    # 短暂等待状态切换到 waiting_answer 后再判定
+    if state["status"] == "running":
+        user_q_at = state.get("user_question_at")
+        if user_q_at is not None and (time.monotonic() - user_q_at) < 5:
+            # 短暂等待状态切换（最多 2 秒）
+            for _ in range(20):
+                await asyncio.sleep(0.1)
+                state = _get_trial(trial_id)
+                if state is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"庭审不存在或已结束：{trial_id}",
+                    )
+                if state["status"] == "waiting_answer":
+                    break
     if state["status"] != "waiting_answer":
         raise HTTPException(
             status_code=409,

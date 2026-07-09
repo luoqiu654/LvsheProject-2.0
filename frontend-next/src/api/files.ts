@@ -39,6 +39,7 @@ export async function analyzeImage(
 export interface DocumentParseResult {
   text: string
   filename?: string
+  parser_used?: string
   [key: string]: unknown
 }
 
@@ -49,7 +50,7 @@ export async function parseDocument(
   const formData = new FormData()
   formData.append("file", file)
   const res = await client.post<DocumentParseResult>(
-    "/api/documents/parse",
+    "/api/document/parse",
     formData,
     {
       headers: { "Content-Type": "multipart/form-data" },

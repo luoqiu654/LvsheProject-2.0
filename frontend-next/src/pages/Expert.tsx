@@ -19,6 +19,7 @@ import {
   type SpeechKind,
   type UserQuestion,
   type TrialVerdict,
+  type EvidenceItem,
 } from "@/api/expert"
 import { MarkdownRenderer } from "@/components/shared/MarkdownRenderer"
 import { ThinkingPanel } from "@/components/shared/ThinkingPanel"
@@ -131,6 +132,12 @@ export default function Expert() {
   const [thinkingContent, setThinkingContent] = useState<
     Record<string, string>
   >({})
+  // 编排步骤（按角色累积 thinking_note，离散步骤数组）
+  const [thinkingStepsByRole, setThinkingStepsByRole] = useState<
+    Record<string, string[]>
+  >({})
+  // 法官证据梳理清单
+  const [evidenceList, setEvidenceList] = useState<EvidenceItem[]>([])
   const [currentlyThinking, setCurrentlyThinking] = useState<TrialRole | null>(
     null,
   )
@@ -188,6 +195,8 @@ export default function Expert() {
     setPendingQuestion(null)
     setAnswerInput("")
     setThinkingContent({})
+    setThinkingStepsByRole({})
+    setEvidenceList([])
     setCurrentlyThinking(null)
 
     const controller = new AbortController()
@@ -203,6 +212,12 @@ export default function Expert() {
           setThinkingContent((prev) => ({
             ...prev,
             [role]: (prev[role] || "") + thinkText,
+          }))
+        },
+        onThinkingNote: (role, step, _round) => {
+          setThinkingStepsByRole((prev) => ({
+            ...prev,
+            [role]: [...(prev[role] || []), step],
           }))
         },
         onSpeech: (role, speechText, kind, round) => {
@@ -268,6 +283,9 @@ export default function Expert() {
           setVerdict(v)
           setCurrentlyThinking(null)
         },
+        onEvidenceList: (items, _round) => {
+          setEvidenceList(items)
+        },
         onDone: (result) => {
           setCurrentlyThinking(null)
           if (result) {
@@ -327,6 +345,8 @@ export default function Expert() {
     setPendingQuestion(null)
     setAnswerInput("")
     setThinkingContent({})
+    setThinkingStepsByRole({})
+    setEvidenceList([])
     setCurrentlyThinking(null)
   }, [isRunning, handleStop])
 
@@ -580,6 +600,7 @@ export default function Expert() {
               headerClass="text-purple-800"
               speeches={chiefJudgeSpeeches}
               thinkingContent={thinkingContent["chief_judge"] || ""}
+              thinkingSteps={thinkingStepsByRole["chief_judge"] || []}
               isThinking={currentlyThinking === "chief_judge"}
             />
 
@@ -592,6 +613,7 @@ export default function Expert() {
                 headerClass="text-blue-800"
                 speeches={plaintiffSpeeches}
                 thinkingContent={thinkingContent["plaintiff"] || ""}
+                thinkingSteps={thinkingStepsByRole["plaintiff"] || []}
                 isThinking={currentlyThinking === "plaintiff"}
               />
               <CourtArea
@@ -601,9 +623,51 @@ export default function Expert() {
                 headerClass="text-red-800"
                 speeches={defendantSpeeches}
                 thinkingContent={thinkingContent["defendant"] || ""}
+                thinkingSteps={thinkingStepsByRole["defendant"] || []}
                 isThinking={currentlyThinking === "defendant"}
               />
             </div>
+
+            {/* 法官证据梳理清单 */}
+            {evidenceList.length > 0 && (
+              <div className="rounded-xl border-2 border-amber-200 bg-amber-50/60 p-4">
+                <div className="mb-2 flex items-center gap-2">
+                  <Scale className="h-4 w-4 text-amber-600" />
+                  <h3 className="text-sm font-bold text-amber-900">
+                    法官证据梳理
+                  </h3>
+                </div>
+                <ul className="space-y-1.5">
+                  {evidenceList.map((ev, i) => (
+                    <li
+                      key={i}
+                      className="rounded-lg border border-amber-100 bg-white/70 px-3 py-2"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-medium text-amber-700">
+                          证据 {i + 1}
+                        </span>
+                        <span className="text-sm font-medium text-gray-800">
+                          {ev.name}
+                        </span>
+                        <span className="ml-auto text-xs text-gray-400">
+                          {ev.target_party === "plaintiff"
+                            ? "向原告确认"
+                            : ev.target_party === "defendant"
+                              ? "向被告确认"
+                              : "向您确认"}
+                        </span>
+                      </div>
+                      {ev.why_key && (
+                        <p className="mt-1 text-xs text-gray-600">
+                          {ev.why_key}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             {/* 法官席（底部） */}
             <CourtArea
@@ -613,6 +677,7 @@ export default function Expert() {
               headerClass="text-green-800"
               speeches={judgeSpeeches.filter((s) => s.role === "judge")}
               thinkingContent={thinkingContent["judge"] || ""}
+              thinkingSteps={thinkingStepsByRole["judge"] || []}
               isThinking={currentlyThinking === "judge"}
             />
 
@@ -661,6 +726,7 @@ interface CourtAreaProps {
   headerClass: string
   speeches: SpeechCard[]
   thinkingContent: string
+  thinkingSteps: string[]
   isThinking: boolean
 }
 
@@ -671,6 +737,7 @@ function CourtArea({
   headerClass,
   speeches,
   thinkingContent,
+  thinkingSteps,
   isThinking,
 }: CourtAreaProps) {
   return (
@@ -684,10 +751,11 @@ function CourtArea({
           </span>
         )}
       </div>
-      {/* 思考过程折叠面板（使用 content prop 展示流式 reasoning_content） */}
-      {(thinkingContent || isThinking) && (
+      {/* 思考过程折叠面板（steps 展示编排提示 + content 展示 reasoning_content） */}
+      {(thinkingSteps.length > 0 || thinkingContent || isThinking) && (
         <ThinkingPanel
-          content={thinkingContent}
+          steps={thinkingSteps.length > 0 ? thinkingSteps : undefined}
+          content={thinkingContent || undefined}
           isThinking={isThinking}
           className="mb-3"
         />
@@ -937,6 +1005,18 @@ function UserQuestionModal({
             法官需要您确认证据
           </h3>
         </div>
+
+        {/* 证据名称（如有） */}
+        {question.evidence_name && (
+          <div className="mb-4 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-100/60 px-3 py-2">
+            <span className="text-xs font-medium text-amber-700">
+              证据项：
+            </span>
+            <span className="text-sm font-bold text-amber-900">
+              {question.evidence_name}
+            </span>
+          </div>
+        )}
 
         {/* 问题 */}
         <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/70 p-3">

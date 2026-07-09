@@ -346,15 +346,40 @@ async def document_parse(
 
     支持格式：Word(.docx)、PDF(.pdf)、纯文本(.txt/.md)、图片(.png/.jpg等)
     图片类型使用 GLM-OCR 视觉模型识别文字。
+    当 PDF/DOCX 解析返回空文本时（如扫描件无文字层），自动调用视觉模型兜底识别。
     """
     try:
         content = await file.read()
         text = await document_parser.parse_bytes_async(content, file.filename)
+        parser_used = ""
+
+        # PDF/DOCX 解析为空时，调用视觉模型兜底（扫描件场景）
+        # 图片类型已走 GLM-OCR 正常路径，无需重复兜底
+        filename_lower = (file.filename or "").lower()
+        needs_vision_fallback = (
+            len(text.strip()) == 0
+            and (filename_lower.endswith(".pdf") or filename_lower.endswith(".docx"))
+        )
+        if needs_vision_fallback:
+            try:
+                ocr_text = await gateway.chat_with_vision(
+                    image=content,
+                    prompt="请识别并提取这份文档的全部文字内容，按原文输出",
+                )
+                if ocr_text and ocr_text.strip():
+                    text = ocr_text
+                    parser_used = "vision_fallback_glm_ocr"
+                else:
+                    parser_used = "fallback_failed"
+            except Exception:
+                # 视觉模型不可用或识别失败，返回原空结果（不崩溃）
+                parser_used = "fallback_failed"
 
         return DocumentParseResponse(
             filename=file.filename,
             text=text,
             char_count=len(text),
+            parser_used=parser_used,
         )
 
     except DocumentParseError as exc:
@@ -586,6 +611,8 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
 
             # 使用 chat_stream_with_reasoning 同时发送思考和正式回答
             # GLM-4.7-Flash 会先输出 reasoning_content（思考过程），再输出 content（正式回答）
+            # 编排步骤（如"分析用户输入..."）保留 thinking 字段（离散列表）；
+            # LLM 的 reasoning_content 改发 reasoning 字段（横向流式段落），与 thinking 严格分离
             async for typ, text in gateway.chat_stream_with_reasoning(
                 messages=raw_messages,
                 model=request.model,
@@ -593,7 +620,7 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                 max_tokens=request.max_tokens,
             ):
                 if typ == "reasoning":
-                    yield f"data: {json.dumps({'thinking': text}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'reasoning': text}, ensure_ascii=False)}\n\n"
                 else:
                     yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
 

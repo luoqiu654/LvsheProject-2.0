@@ -1,4 +1,4 @@
-# LvsheProject 3.1 - 法律 AI Agent 系统
+# LvsheProject 3.2 - 法律 AI Agent 系统
 
 > 红岩网校 Agent 方向考核项目 | 基于 FastAPI + React 18 的全栈法律 AI 智能体系统
 
@@ -144,6 +144,12 @@ LvsheProject/
 ```
 
 ## 版本历史
+- **v3.2** - 思考过程显示优化 + 文件视觉兜底 + 专家会诊流程优化 + 地图180°旋转
+  - chat：修复思考过程竖排异常，reasoning_content 改走 content 段落横向流式显示，编排步骤仍为离散列表
+  - chat：PDF/Word 解析为空时自动调用 GLM-OCR 视觉模型兜底，统一文件识别逻辑
+  - chat+专家：判决 reasoning 回退、speech 空文本兜底、thinking_note 事件分离编排提示与模型 reasoning
+  - 专家：法官主动梳理所需证据清单→向用户针对性追问；修复 user_question 竞态导致多轮中断；超时保护；单轮异常容错；法官禁止端水
+  - 地图：新增 180° 3D 视角旋转按钮（高德/MapTiler 模式），2D 模式不显示
 - **v3.1** - 高德地图快速模式 + 法官追问重构 + LLM模型编排 + 思考过程折叠
 - **v3.0** - React 前端重构 + 视觉AI流水线 + 法庭模拟 + 3D地图
 - **v2.2** - Streamlit 前端 + 智谱AI 6模型统一接入

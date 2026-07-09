@@ -67,18 +67,29 @@ export interface UserQuestion {
   question: string
   context: string
   round: number
+  /** 对应的证据项名称（证据梳理阶段追问时携带） */
+  evidence_name?: string
+}
+
+/** 证据项（法官梳理的关键证据清单） */
+export interface EvidenceItem {
+  name: string
+  why_key: string
+  target_party: "plaintiff" | "defendant" | "user"
 }
 
 /** SSE 流式事件类型（与后端 multi_agents.py 的 "type" 字段一致） */
 export type TrialEventType =
   | "trial_started"
   | "thinking"
+  | "thinking_note"     // 编排提示（离散步骤，如"法官正在审查..."）
   | "speech"
   | "speech_end"
   | "user_question"
   | "user_answer"
   | "round_end"
   | "verdict"
+  | "evidence_list"     // 法官证据梳理清单
   | "done"
   | "error"
 
@@ -107,6 +118,10 @@ export interface TrialStreamEvent {
   result?: TrialResult
   // error
   message?: string
+  // evidence_list
+  items?: EvidenceItem[]
+  // user_question (evidence_name 附加字段)
+  evidence_name?: string
 }
 
 /** 庭审请求参数 */
@@ -122,6 +137,8 @@ export interface TrialStreamCallbacks {
   onTrialStarted?: (trialId: string) => void
   /** 思考过程片段（reasoning_content 流式 / 一次性通知） */
   onThinking?: (role: TrialRole, text: string, round: number) => void
+  /** 编排提示（离散步骤，如"法官正在审查..."），与 reasoning 分离 */
+  onThinkingNote?: (role: TrialRole, step: string, round: number) => void
   /** 发言片段（增量文本，前端需累加到当前发言） */
   onSpeech?: (role: TrialRole, text: string, kind: SpeechKind, round: number) => void
   /** 某角色的某段发言结束（标记当前发言卡片为完成） */
@@ -134,6 +151,8 @@ export interface TrialStreamCallbacks {
   onRoundEnd?: (round: number) => void
   /** 最终判决（结构化） */
   onVerdict?: (verdict: TrialVerdict, round: number) => void
+  /** 法官证据梳理清单（主动梳理） */
+  onEvidenceList?: (items: EvidenceItem[], round: number) => void
   /** 庭审完成，result 为完整结果（可能含 verdict） */
   onDone?: (result: TrialResult | undefined) => void
   /** 出错 */
@@ -266,6 +285,15 @@ function dispatchEvent(
         )
       }
       break
+    case "thinking_note":
+      if (event.role && event.text) {
+        opts.onThinkingNote?.(
+          event.role,
+          event.text,
+          event.round ?? 0,
+        )
+      }
+      break
     case "speech":
       if (event.role && event.text) {
         opts.onSpeech?.(
@@ -292,6 +320,7 @@ function dispatchEvent(
           question: event.question || "",
           context: event.context || "",
           round: event.round ?? 0,
+          evidence_name: event.evidence_name,
         })
       }
       break
@@ -308,6 +337,11 @@ function dispatchEvent(
     case "verdict":
       if (event.verdict) {
         opts.onVerdict?.(event.verdict, event.round ?? 0)
+      }
+      break
+    case "evidence_list":
+      if (event.items) {
+        opts.onEvidenceList?.(event.items, event.round ?? 0)
       }
       break
     case "done":
