@@ -33,7 +33,7 @@ from backend.config import PROJECT_ROOT
 # ========== 安全配置 ==========
 OUTPUT_ROOT = PROJECT_ROOT / "output" / "contract_review"
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_EXTENSIONS = {".docx"}
+ALLOWED_EXTENSIONS = {".docx", ".pdf"}
 TEMP_FILE_EXPIRE_HOURS = 24  # 临时文件过期时间
 
 
@@ -137,8 +137,10 @@ class ContractAnnotator:
         """
         保存原始文件。
 
+        对于 PDF 文件，会同时保留原始 PDF 并生成一份 docx 副本用于后续标注。
+
         Returns:
-            保存后的文件路径
+            保存后的文件路径（用于标注的 docx 路径）
         """
         self._validate_file(original_filename, len(file_bytes))
         user_dir = self._get_user_dir(user_id)
@@ -147,12 +149,52 @@ class ContractAnnotator:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = Path(original_filename).stem
         safe_name = re.sub(r'[^a-zA-Z0-9_\-\u4e00-\u9fa5]', '_', safe_name)
-        new_filename = f"{timestamp}_{safe_name}_original.docx"
+        ext = Path(original_filename).suffix.lower()
 
+        if ext == ".pdf":
+            # 保留原始 PDF
+            pdf_filename = f"{timestamp}_{safe_name}_original.pdf"
+            pdf_path = user_dir / pdf_filename
+            pdf_path.write_bytes(file_bytes)
+
+            # 将 PDF 转为 docx 用于标注
+            docx_filename = f"{timestamp}_{safe_name}_original.docx"
+            docx_path = user_dir / docx_filename
+            self._pdf_to_docx(file_bytes, docx_path)
+            return str(docx_path)
+
+        # docx 直接保存
+        new_filename = f"{timestamp}_{safe_name}_original.docx"
         file_path = user_dir / new_filename
         file_path.write_bytes(file_bytes)
-
         return str(file_path)
+
+    def _pdf_to_docx(self, pdf_bytes: bytes, output_path: Path) -> None:
+        """
+        将 PDF 内容提取并写入 docx 文件，用于后续标注。
+
+        使用 pdfplumber 提取文本，保留段落结构。
+        """
+        import io
+        try:
+            import pdfplumber
+        except ImportError as exc:
+            raise ContractAnnotationError(
+                "缺少 pdfplumber 依赖，请安装：uv add pdfplumber"
+            ) from exc
+
+        doc = Document()
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    for line in text.split("\n"):
+                        if line.strip():
+                            doc.add_paragraph(line)
+                # 换页
+                doc.add_page_break()
+
+        doc.save(str(output_path))
 
     def annotate_contract(
         self,

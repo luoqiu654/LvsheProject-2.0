@@ -12,6 +12,79 @@ if str(ROOT) not in sys.path:
 from frontend.api_client import APIClientError, LvsheAPIClient, stream_text_generator
 
 
+# ========== 辅助函数（必须在调用前定义，Streamlit 自上而下执行） ==========
+
+
+def _extract_risk_points_simple(review_text: str) -> list[dict]:
+    """
+    从审查结果文本中提取风险点。
+
+    实际项目中应该让Skill输出结构化的风险点。
+    这里做简化处理。
+
+    返回字段与 RiskPointSchema 对齐：
+    - id: 风险点ID
+    - clause_text: 问题条款原文
+    - risk_level: high / medium / low
+    - risk_type: 风险类型
+    - description: 风险说明
+    - suggestion: 修改建议
+    """
+    risk_points: list[dict] = []
+    lines = review_text.split("\n")
+
+    current_risk: dict | None = None
+    for line in lines:
+        line = line.strip()
+
+        # 检测风险点
+        if line.startswith(("风险", "问题", "⚠️", "🔴", "🟡", "🟢")) or "风险" in line[:10]:
+            if current_risk:
+                risk_points.append(current_risk)
+
+            risk_level = "medium"
+            if "高风险" in line or "🔴" in line or "严重" in line or "重大" in line:
+                risk_level = "high"
+            elif "低风险" in line or "🟢" in line or "轻微" in line:
+                risk_level = "low"
+
+            current_risk = {
+                "id": f"risk-{len(risk_points) + 1}",
+                "clause_text": line[:50],
+                "risk_type": "合同风险",
+                "risk_level": risk_level,
+                "description": line,
+                "suggestion": "建议修改相关条款",
+            }
+        elif current_risk and line and not line.startswith(("建议", "说明")):
+            current_risk["description"] += "\n" + line
+
+    if current_risk:
+        risk_points.append(current_risk)
+
+    # 如果没有解析到，创建默认风险点
+    if not risk_points:
+        risk_points.append({
+            "id": "risk-1",
+            "clause_text": "合同整体审查",
+            "risk_type": "general",
+            "risk_level": "medium",
+            "description": review_text[:200],
+            "suggestion": "建议仔细审查合同条款，确保各方权益明确",
+        })
+
+    return risk_points
+
+
+def _level_emoji(level: str) -> str:
+    """风险等级对应的 emoji。"""
+    return {
+        "high": "🔴 高风险",
+        "medium": "🟡 中风险",
+        "low": "🟢 低风险",
+    }.get(level, "🟡 中风险")
+
+
 st.set_page_config(
     page_title="合同审查",
     page_icon="📄",
@@ -156,6 +229,10 @@ if review_button:
         st.warning("请输入合同内容。")
         st.stop()
 
+    # 清除上一次的预览结果
+    st.session_state.annotated_result = None
+    st.session_state.annotated_risk_points = []
+
     skill_name = None
     if skill_mode == "固定使用 contract-risk-review":
         skill_name = "contract-risk-review"
@@ -170,7 +247,7 @@ if review_button:
                     user_id=user_id,
                     use_llm=use_llm,
                 )
-                memory_context = memory_result["memory_context"]
+                memory_context = memory_result.get("memory_context", "")
 
             # ========== 步骤2：构建增强输入 ==========
             enhanced_input = contract_text
@@ -240,6 +317,12 @@ if review_button:
         st.error(str(exc))
 
 # ========== 生成带标注的修订版 ==========
+# 会话状态：保存生成结果，便于在预览和下载间保持状态
+if "annotated_result" not in st.session_state:
+    st.session_state.annotated_result = None
+if "annotated_risk_points" not in st.session_state:
+    st.session_state.annotated_risk_points = []
+
 if generate_button and st.session_state.pending_annotation:
     try:
         with st.spinner("正在生成带标注的修订版文件..."):
@@ -255,90 +338,112 @@ if generate_button and st.session_state.pending_annotation:
                 user_id=user_id,
             )
 
-        st.success("✅ 带标注的修订版文件已生成！")
-
-        # 显示文件信息
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("风险点总数", result.get("risk_count", 0))
-        with col2:
-            st.metric("高风险", result.get("high_risk_count", 0))
-        with col3:
-            st.metric("中风险", result.get("medium_risk_count", 0))
-
-        # 下载按钮
-        st.markdown("### 📥 下载文件")
-
-        filename = result.get("annotated_filename", "annotated_contract.docx")
-        download_url = client.contract_download_url(filename, user_id)
-
-        st.markdown(
-            f'<a href="{download_url}" target="_blank" '
-            f'style="display: inline-block; padding: 10px 20px; '
-            f'background-color: #4CAF50; color: white; text-decoration: none; '
-            f'border-radius: 5px; font-weight: bold;">'
-            f'⬇️ 下载带标注的修订版（{filename}）</a>',
-            unsafe_allow_html=True,
-        )
-
-        st.caption("文件包含：红色高亮的问题条款 + 批注形式的风险说明")
-
-        # 重置状态
+        # 保存到会话状态，让预览和下载按钮共享
+        st.session_state.annotated_result = result
+        st.session_state.annotated_risk_points = risk_points
         st.session_state.pending_annotation = False
+        st.success("✅ 带标注的修订版文件已生成！请先预览，确认后再下载。")
 
     except APIClientError as exc:
         st.error(f"生成标注文件失败：{exc}")
 
+# ========== 预览 + 下载 ==========
+if st.session_state.annotated_result:
+    result = st.session_state.annotated_result
+    risk_points = st.session_state.annotated_risk_points
+    contract_text = st.session_state.last_contract_text
 
-def _extract_risk_points_simple(review_text: str) -> list[dict]:
-    """
-    从审查结果文本中简单提取风险点。
+    st.markdown("---")
+    st.subheader("👁️ 修订版预览")
 
-    实际项目中应该让Skill输出结构化的风险点。
-    这里做简化处理。
-    """
-    risk_points = []
-    lines = review_text.split("\n")
+    # 文件统计信息
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("风险点总数", result.get("risk_count", 0))
+    with col2:
+        st.metric("🔴 高风险", result.get("high_risk_count", 0))
+    with col3:
+        st.metric("🟡 中风险", result.get("medium_risk_count", 0))
+    with col4:
+        st.metric("🟢 低风险", result.get("low_risk_count", 0))
 
-    current_risk = None
-    for line in lines:
-        line = line.strip()
+    # ========== 风险点列表预览 ==========
+    with st.expander(f"📋 风险点详情（共 {len(risk_points)} 个）", expanded=True):
+        if risk_points:
+            for idx, risk in enumerate(risk_points, start=1):
+                level = risk.get("risk_level", "medium")
+                clause = risk.get("clause_text", "")
+                desc = risk.get("description", "")
+                suggestion = risk.get("suggestion", "")
+                risk_type = risk.get("risk_type", "")
 
-        # 检测风险点
-        if line.startswith(("风险", "问题", "⚠️", "🔴", "🟡", "🟢")) or "风险" in line[:10]:
-            if current_risk:
-                risk_points.append(current_risk)
+                st.markdown(
+                    f"**{idx}. {_level_emoji(level)}** "
+                    f"`{risk_type}`"
+                )
+                st.markdown(f"- **问题条款**：{clause}")
+                st.markdown(f"- **风险说明**：{desc}")
+                if suggestion:
+                    st.markdown(f"- **修改建议**：{suggestion}")
+                st.divider()
+        else:
+            st.info("未检测到具体风险点。")
 
-            severity = "medium"
-            if "高风险" in line or "🔴" in line or "严重" in line or "重大" in line:
-                severity = "high"
-            elif "低风险" in line or "🟢" in line or "轻微" in line:
-                severity = "low"
+    # ========== 合同原文预览（高亮风险条款） ==========
+    with st.expander("📄 合同原文预览（风险条款已标注）", expanded=False):
+        # 将风险条款在原文中高亮显示
+        highlighted_text = contract_text
+        # 按 clause_text 长度降序替换，避免短串覆盖长串
+        sorted_risks = sorted(
+            risk_points,
+            key=lambda r: len(r.get("clause_text", "")),
+            reverse=True,
+        )
+        # 用纯文本标记替代 HTML（Streamlit markdown 对 html 支持有限）
+        for risk in sorted_risks:
+            clause = risk.get("clause_text", "").strip()
+            if clause and clause in highlighted_text:
+                level = risk.get("risk_level", "medium")
+                marker = {
+                    "high": "🔴",
+                    "medium": "🟡",
+                    "low": "🟢",
+                }.get(level, "🟡")
+                highlighted_text = highlighted_text.replace(
+                    clause,
+                    f"{marker}【{clause}】{marker}",
+                )
 
-            current_risk = {
-                "clause": line[:50],
-                "risk_type": "合同风险",
-                "severity": severity,
-                "description": line,
-                "suggestion": "建议修改相关条款",
-            }
-        elif current_risk and line and not line.startswith(("建议", "说明")):
-            current_risk["description"] += "\n" + line
+        st.text_area(
+            "合同内容（标记后）",
+            value=highlighted_text,
+            height=300,
+            disabled=True,
+        )
 
-    if current_risk:
-        risk_points.append(current_risk)
+    # ========== 下载按钮 ==========
+    st.markdown("### 📥 确认下载")
+    st.caption("确认预览内容无误后，点击下方按钮下载带标注的修订版 Word 文件。")
 
-    # 如果没有解析到，创建默认风险点
-    if not risk_points:
-        risk_points.append({
-            "clause": "合同整体审查",
-            "risk_type": "general",
-            "severity": "medium",
-            "description": review_text[:200],
-            "suggestion": "建议仔细审查合同条款，确保各方权益明确",
-        })
+    filename = result.get("annotated_filename", "annotated_contract.docx")
+    download_url = client.contract_download_url(filename, user_id)
 
-    return risk_points
+    st.markdown(
+        f'<a href="{download_url}" target="_blank" '
+        f'style="display: inline-block; padding: 10px 20px; '
+        f'background-color: #4CAF50; color: white; text-decoration: none; '
+        f'border-radius: 5px; font-weight: bold;">'
+        f'⬇️ 下载带标注的修订版（{filename}）</a>',
+        unsafe_allow_html=True,
+    )
+
+    st.caption("文件包含：红色高亮的问题条款 + 批注形式的风险说明")
+
+    # 清除预览，重新审查
+    if st.button("🔄 清除预览，重新审查", type="secondary"):
+        st.session_state.annotated_result = None
+        st.session_state.annotated_risk_points = []
+        st.rerun()
 
 
 # ========== 显示会话历史 ==========

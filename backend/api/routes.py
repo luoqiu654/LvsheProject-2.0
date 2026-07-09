@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 import json
 import tempfile
@@ -31,6 +32,8 @@ from backend.api.schemas import (
     GUIBrowseRequest,
     GUIBrowseResponse,
     ImageAnalyzeResponse,
+    ImageGenerateRequest,
+    ImageGenerateResponse,
     ImageSearchRequest,
     ImageSearchResponse,
     ImageSearchResultSchema,
@@ -39,14 +42,18 @@ from backend.api.schemas import (
     ListFilesResponse,
     MemoryChatRequest,
     MemoryChatResponse,
+    ModelsInfoResponse,
     MultiAgentDebateRequest,
     MultiAgentDebateResponse,
+    MultiTurnChatRequest,
     RAGAskRequest,
     RAGAskResponse,
     RiskPointSchema,
     SkillRunRequest,
     SkillRunResponse,
     StatusResponse,
+    VisionAnalyzeRequest,
+    VisionAnalyzeResponse,
 )
 from backend.core.agents import agent
 from backend.core.contract_annotator import contract_annotator
@@ -145,7 +152,10 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
 @router.post("/rag/index-sample", response_model=IndexSampleResponse)
 async def index_sample() -> IndexSampleResponse:
-    indexed = rag.index_directory(PROJECT_ROOT / "data" / "raw")
+    # 用 asyncio.to_thread 在线程中运行同步方法，避免阻塞事件循环
+    indexed = await asyncio.to_thread(
+        rag.index_directory, PROJECT_ROOT / "data" / "raw"
+    )
 
     return IndexSampleResponse(
         indexed_chunks=indexed,
@@ -333,10 +343,11 @@ async def document_parse(
     上传并解析单个文档，提取纯文本内容。
 
     支持格式：Word(.docx)、PDF(.pdf)、纯文本(.txt/.md)、图片(.png/.jpg等)
+    图片类型使用 GLM-OCR 视觉模型识别文字。
     """
     try:
         content = await file.read()
-        text = document_parser.parse_bytes(content, file.filename)
+        text = await document_parser.parse_bytes_async(content, file.filename)
 
         return DocumentParseResponse(
             filename=file.filename,
@@ -358,6 +369,7 @@ async def document_parse_batch(
     批量上传并解析多个文档，提取纯文本内容。
 
     支持格式：Word(.docx)、PDF(.pdf)、纯文本(.txt/.md)
+    图片类型使用 GLM-OCR 视觉模型识别文字。
     返回每个文件的解析结果，成功和失败分开统计。
     """
     results = []
@@ -367,7 +379,7 @@ async def document_parse_batch(
     for file in files:
         try:
             content = await file.read()
-            text = document_parser.parse_bytes(content, file.filename)
+            text = await document_parser.parse_bytes_async(content, file.filename)
             results.append({
                 "filename": file.filename,
                 "success": True,
@@ -437,6 +449,80 @@ async def chat_stream(request: ChatRequest):
     )
 
 
+@router.post("/chat/multi-turn")
+async def chat_multi_turn(request: MultiTurnChatRequest):
+    """
+    多轮对话流式接口，返回 SSE 格式。
+
+    请求体接受完整的对话历史 messages，后端直接透传给 LLM，
+    支持真正的多轮上下文。
+
+    事件格式：
+        data: {"text": "片段"}\n\n
+        data: {"done": true}\n\n   (结束)
+        data: {"error": "..."}\n\n  (出错)
+    """
+    # 组装消息列表
+    raw_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+
+    # 如果开启 RAG，用最后一条用户消息检索法律知识并注入系统提示
+    if request.use_rag:
+        last_user_msg = next(
+            (m.content for m in reversed(request.messages) if m.role == "user"),
+            "",
+        )
+        if last_user_msg:
+            try:
+                contexts = rag.search(last_user_msg, top_k=4)
+                if contexts:
+                    context_text = "\n\n---\n\n".join(
+                        c.get("content", "")[:800] for c in contexts if c.get("content")
+                    )
+                    rag_system = (
+                        "你是严谨、专业、友好的中文法律 AI 助手。"
+                        "以下是与用户问题相关的法律知识片段，请在回答时参考：\n\n"
+                        f"{context_text}\n\n"
+                        "请基于以上知识和你的专业判断回答用户问题。"
+                    )
+                    # 如果首条不是 system，则插入；否则替换
+                    if raw_messages and raw_messages[0]["role"] == "system":
+                        raw_messages[0]["content"] = rag_system
+                    else:
+                        raw_messages.insert(0, {"role": "system", "content": rag_system})
+            except Exception:
+                # RAG 检索失败不阻断对话
+                pass
+
+    async def generate():
+        try:
+            async for chunk in gateway.chat_stream(
+                messages=raw_messages,
+                model=request.model,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+            ):
+                yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+
+        except LLMGatewayError as exc:
+            yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'error': f'服务端错误: {exc}'}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # ============================================================================
 # 合同审查相关接口
 # ============================================================================
@@ -459,9 +545,9 @@ async def contract_review(request: ContractReviewRequest) -> ContractReviewRespo
         # 解析风险点（简化版，实际应该从Skill输出中结构化提取）
         risk_points = _parse_risk_points(result.output_text)
 
-        high_count = sum(1 for r in risk_points if r.severity == "high")
-        medium_count = sum(1 for r in risk_points if r.severity == "medium")
-        low_count = sum(1 for r in risk_points if r.severity == "low")
+        high_count = sum(1 for r in risk_points if r.risk_level == "high")
+        medium_count = sum(1 for r in risk_points if r.risk_level == "medium")
+        low_count = sum(1 for r in risk_points if r.risk_level == "low")
 
         summary = f"共发现 {len(risk_points)} 处风险点，其中高风险 {high_count} 处，中风险 {medium_count} 处，低风险 {low_count} 处。"
 
@@ -493,28 +579,35 @@ async def contract_generate_annotated(
 
         risk_points = [
             RiskPoint(
-                clause=rp.clause,
+                id=rp.id or f"risk-{idx}",
+                clause_text=rp.clause_text,
+                risk_level=rp.risk_level,
                 risk_type=rp.risk_type,
-                severity=rp.severity,
                 description=rp.description,
                 suggestion=rp.suggestion,
             )
-            for rp in request.risk_points
+            for idx, rp in enumerate(request.risk_points, start=1)
         ]
 
-        # 先保存原始文件
-        import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".docx", delete=False, encoding="utf-8"
-        ) as tmp:
-            # 注意：这里简化处理，实际应该从上传的文件生成
-            # 由于contract_text是纯文本，我们需要先创建docx
-            from docx import Document
-            doc = Document()
-            for line in request.contract_text.split("\n"):
-                doc.add_paragraph(line)
-            doc.save(tmp.name)
-            original_path = tmp.name
+        # 将 contract_text 转为 docx bytes，然后用 save_original 保存到 user_dir
+        # 这样 annotate_contract 的安全检查（文件必须在 user_dir 下）才能通过
+        import io
+        from docx import Document as DocxDocument
+
+        doc = DocxDocument()
+        for line in request.contract_text.split("\n"):
+            doc.add_paragraph(line)
+
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        docx_bytes = buffer.getvalue()
+
+        # 用 save_original 保存到用户隔离目录（安全检查要求文件在 user_dir 下）
+        original_path = contract_annotator.save_original(
+            file_bytes=docx_bytes,
+            original_filename=request.original_file_name or "contract_review.docx",
+            user_id=request.user_id,
+        )
 
         # 生成标注文件
         result = contract_annotator.annotate_contract(
@@ -631,7 +724,7 @@ def _parse_risk_points(output_text: str) -> list[RiskPointSchema]:
     lines = output_text.split("\n")
 
     current_risk = None
-    for line in lines:
+    for idx, line in enumerate(lines, start=1):
         line = line.strip()
 
         # 检测风险点开头
@@ -639,16 +732,17 @@ def _parse_risk_points(output_text: str) -> list[RiskPointSchema]:
             if current_risk:
                 risk_points.append(current_risk)
 
-            severity = "medium"
+            risk_level = "medium"
             if "高风险" in line or "🔴" in line or "严重" in line:
-                severity = "high"
+                risk_level = "high"
             elif "低风险" in line or "🟢" in line or "轻微" in line:
-                severity = "low"
+                risk_level = "low"
 
             current_risk = RiskPointSchema(
-                clause=line[:50],
+                id=f"risk-{idx}",
+                clause_text=line[:50],
                 risk_type="未知",
-                severity=severity,
+                risk_level=risk_level,
                 description=line,
                 suggestion="",
             )
@@ -662,9 +756,10 @@ def _parse_risk_points(output_text: str) -> list[RiskPointSchema]:
     if not risk_points:
         risk_points.append(
             RiskPointSchema(
-                clause="合同整体",
+                id="risk-1",
+                clause_text="合同整体",
                 risk_type="general",
-                severity="medium",
+                risk_level="medium",
                 description=output_text[:200],
                 suggestion="建议仔细审查合同条款",
             )
@@ -931,3 +1026,154 @@ async def graph_rag_index_text(text: str, source: str = "api", use_llm: bool = T
 
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"图谱索引失败：{exc}") from exc
+
+
+# ============================================================================
+# 视觉模型（GLM-OCR）与图像生成（GLM-Image）相关接口
+# ============================================================================
+
+@router.get("/models", response_model=ModelsInfoResponse)
+async def models_info() -> ModelsInfoResponse:
+    """
+    获取当前可用的所有模型信息。
+
+    返回 4 个文本模型、1 个视觉模型、1 个图像生成模型。
+    """
+    return ModelsInfoResponse(
+        text_models=gateway.available_providers(),
+        vision_model=settings.zhipu_vision_model,
+        image_model=settings.zhipu_image_model,
+        default_model=settings.default_llm_model,
+    )
+
+
+@router.post("/vision/analyze", response_model=VisionAnalyzeResponse)
+async def vision_analyze(request: VisionAnalyzeRequest) -> VisionAnalyzeResponse:
+    """
+    使用 GLM-OCR 视觉模型识别图片中的文字。
+
+    接收 base64 编码的图片，返回识别到的文本。
+    适用于合同扫描件、法律文书照片等场景。
+    """
+    try:
+        import base64 as _b64
+
+        image_bytes = _b64.b64decode(request.image_base64)
+        text = await gateway.chat_with_vision(
+            image=image_bytes,
+            prompt=request.prompt,
+        )
+
+        return VisionAnalyzeResponse(
+            model=settings.zhipu_vision_model,
+            text=text,
+            char_count=len(text),
+        )
+
+    except LLMGatewayError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"视觉识别失败：{exc}") from exc
+
+
+@router.post("/vision/analyze-file", response_model=VisionAnalyzeResponse)
+async def vision_analyze_file(
+    file: UploadFile = File(...),
+    prompt: str = "请识别并提取图片中的所有文字内容，保持原有格式。",
+) -> VisionAnalyzeResponse:
+    """
+    上传图片文件，使用 GLM-OCR 视觉模型识别文字。
+
+    支持 .png / .jpg / .jpeg / .bmp / .webp 格式。
+    """
+    try:
+        content = await file.read()
+        text = await gateway.chat_with_vision(
+            image=content,
+            prompt=prompt,
+        )
+
+        return VisionAnalyzeResponse(
+            model=settings.zhipu_vision_model,
+            text=text,
+            char_count=len(text),
+        )
+
+    except LLMGatewayError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"视觉识别失败：{exc}") from exc
+
+
+@router.post("/image/generate", response_model=ImageGenerateResponse)
+async def image_generate(request: ImageGenerateRequest) -> ImageGenerateResponse:
+    """
+    使用 GLM-Image 模型生成图片。
+
+    生成的图片会保存到用户隔离目录，返回本地文件路径列表。
+    适用于文档批注配图、法律场景示意图等。
+    """
+    try:
+        image_paths = await gateway.generate_image(
+            prompt=request.prompt,
+            size=request.size,
+            n=request.n,
+            user_id=request.user_id,
+        )
+
+        return ImageGenerateResponse(
+            model=settings.zhipu_image_model,
+            image_paths=image_paths,
+            image_count=len(image_paths),
+            prompt=request.prompt,
+        )
+
+    except LLMGatewayError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"图像生成失败：{exc}") from exc
+
+
+@router.get("/image/download")
+async def image_download(filename: str, user_id: str = "default"):
+    """
+    下载生成的图片文件。
+    """
+    try:
+        import re
+
+        safe_user_id = re.sub(r'[^a-zA-Z0-9_\-]', '_', user_id) or "anonymous"
+        file_path = (
+            settings.contract_output_path
+            / safe_user_id
+            / "generated_images"
+            / filename
+        )
+
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="图片文件不存在")
+
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type="image/png",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"下载图片失败：{exc}") from exc
+
+
+@router.get("/llm/health")
+async def llm_health_check(model: str | None = None):
+    """
+    LLM 网关健康检查。
+
+    会真实调用指定模型（默认为默认模型），消耗少量 token。
+    """
+    try:
+        result = await gateway.health_check(model=model)
+        return {"ok": True, **result}
+    except LLMGatewayError as exc:
+        return {"ok": False, "error": str(exc)}

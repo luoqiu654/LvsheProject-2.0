@@ -12,12 +12,27 @@ class BaseAPIResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="用户消息")
-    provider: Optional[str] = Field(default=None, description="LLM provider，例如 qwen / glm")
+    provider: Optional[str] = Field(default=None, description="LLM 模型名，例如 glm-4.7-flash / glm-4.6 / glm-5.2")
     use_llm: bool = Field(default=True)
 
 
 class ChatResponse(BaseAPIResponse):
     answer: str
+
+
+class ChatMessage(BaseModel):
+    """单条对话消息（多轮对话）。"""
+    role: str = Field(..., description="角色：system / user / assistant")
+    content: str = Field(..., description="消息内容")
+
+
+class MultiTurnChatRequest(BaseModel):
+    """多轮对话流式请求。"""
+    messages: list[ChatMessage] = Field(..., min_length=1, description="对话历史")
+    model: Optional[str] = Field(default=None, description="模型名，留空用默认")
+    temperature: float = Field(default=0.6, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=2048, ge=1, le=8192)
+    use_rag: bool = Field(default=False, description="是否注入法律知识库上下文")
 
 
 class RAGAskRequest(BaseModel):
@@ -141,9 +156,10 @@ class ContractReviewRequest(BaseModel):
 
 class RiskPointSchema(BaseModel):
     """风险点。"""
-    clause: str = Field(..., description="问题条款")
+    id: str = Field(default="", description="风险点ID")
+    clause_text: str = Field(..., description="问题条款原文")
+    risk_level: str = Field(..., description="风险等级：high/medium/low")
     risk_type: str = Field(..., description="风险类型")
-    severity: str = Field(..., description="严重程度：high/medium/low")
     description: str = Field(..., description="风险说明")
     suggestion: str = Field(default="", description="修改建议")
 
@@ -301,3 +317,52 @@ class GraphStatsResponse(BaseAPIResponse):
     relations: int
     is_connected: bool
     use_memory_fallback: bool
+
+
+# ========== 视觉模型（GLM-OCR）相关 ==========
+
+class VisionAnalyzeRequest(BaseModel):
+    """视觉分析请求（JSON 方式，使用 base64 图片）。"""
+    prompt: str = Field(
+        default="请识别并提取图片中的所有文字内容，保持原有格式。",
+        description="识别提示词",
+    )
+    image_base64: str = Field(..., description="base64 编码的图片数据")
+
+
+class VisionAnalyzeResponse(BaseAPIResponse):
+    """视觉分析响应。"""
+    model: str = Field(..., description="使用的视觉模型名")
+    text: str = Field(..., description="识别到的文本内容")
+    char_count: int = Field(..., description="文本字符数")
+
+
+# ========== 图像生成（GLM-Image）相关 ==========
+
+class ImageGenerateRequest(BaseModel):
+    """图像生成请求。"""
+    prompt: str = Field(..., min_length=1, description="图片描述提示词")
+    size: str = Field(
+        default="1024x1024",
+        description="图片尺寸，如 1024x1024 / 768x1344 / 1344x768",
+    )
+    n: int = Field(default=1, ge=1, le=4, description="生成图片数量")
+    user_id: str = Field(default="default", description="用户ID（用于存储隔离）")
+
+
+class ImageGenerateResponse(BaseAPIResponse):
+    """图像生成响应。"""
+    model: str = Field(..., description="使用的图像生成模型名")
+    image_paths: list[str] = Field(..., description="生成的图片本地路径列表")
+    image_count: int = Field(..., description="生成图片数量")
+    prompt: str = Field(..., description="生成提示词")
+
+
+# ========== 模型信息相关 ==========
+
+class ModelsInfoResponse(BaseAPIResponse):
+    """可用模型信息响应。"""
+    text_models: list[str] = Field(..., description="文本对话模型列表")
+    vision_model: str = Field(..., description="视觉模型名")
+    image_model: str = Field(..., description="图像生成模型名")
+    default_model: str = Field(..., description="默认文本模型名")

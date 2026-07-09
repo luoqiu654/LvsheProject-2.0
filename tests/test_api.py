@@ -22,7 +22,8 @@ def test_status():
     data = response.json()
 
     assert data["ok"] is True
-    assert "qwen" in data["available_llm_providers"]
+    # 现在使用智谱 GLM 文本模型
+    assert "glm-4.7-flash" in data["available_llm_providers"]
     assert data["modules"]["rag"] is True
     assert data["modules"]["multi_agents"] is True
 

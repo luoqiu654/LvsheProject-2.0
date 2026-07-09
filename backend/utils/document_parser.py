@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import tempfile
@@ -568,6 +569,75 @@ class DocumentParser:
             except Exception:
                 pass
 
+    async def parse_bytes_async(self, file_bytes: bytes, filename: str) -> str:
+        """
+        从字节流异步解析文件，返回纯文本。
+
+        用于 FastAPI 异步路由中，支持图片识别（调用 GLM-OCR）。
+        """
+        result = await self.parse_bytes_structured_async(file_bytes, filename)
+        return result.text
+
+    async def parse_bytes_structured_async(
+        self, file_bytes: bytes, filename: str
+    ) -> ParsedDocument:
+        """
+        从字节流异步解析文件，返回结构化结果。
+
+        与同步版本的区别：图片类型走异步视觉模型路径。
+        """
+        ext = Path(filename).suffix.lower()
+        if ext not in self.SUPPORTED_EXTENSIONS:
+            raise DocumentParseError(f"不支持的文件格式：{ext}")
+
+        # 写入临时文件
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        try:
+            return await self.parse_file_structured_async(tmp_path)
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    async def parse_file_structured_async(
+        self, file_path: str | Path
+    ) -> ParsedDocument:
+        """
+        异步解析文件，返回结构化结果。
+
+        与同步版本的区别：图片类型走异步视觉模型路径（GLM-OCR），
+        其他类型仍使用同步解析器（文件 I/O 较快，可接受阻塞）。
+        """
+        path = Path(file_path)
+        if not path.exists():
+            raise DocumentParseError(f"文件不存在：{file_path}")
+
+        ext = path.suffix.lower()
+        if ext not in self.SUPPORTED_EXTENSIONS:
+            raise DocumentParseError(f"不支持的文件格式：{ext}")
+
+        try:
+            if ext == ".docx":
+                return self._parse_docx_smart(path)
+            elif ext == ".pdf":
+                return self._parse_pdf_smart(path)
+            elif ext in (".txt", ".md"):
+                return self._parse_text(path)
+            elif ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+                return await self._parse_image_async(path)
+            elif ext in (".pptx", ".xlsx", ".csv"):
+                return self._parse_with_unstructured(path)
+            else:
+                raise DocumentParseError(f"不支持的格式：{ext}")
+        except DocumentParseError:
+            raise
+        except Exception as exc:
+            raise DocumentParseError(f"解析文件失败：{exc}") from exc
+
     # ========== 智能解析路由 ==========
 
     def _parse_docx_smart(self, path: Path) -> ParsedDocument:
@@ -698,46 +768,94 @@ class DocumentParser:
 
     def _parse_image(self, path: Path) -> ParsedDocument:
         """
-        使用视觉模型识别图片中的文字。
+        使用视觉模型识别图片中的文字（同步入口）。
+
+        注意：当在异步上下文中调用时，请优先使用 _parse_image_async。
+        本方法在没有运行事件循环时使用 asyncio.run 调用异步版本；
+        若已在事件循环内则抛出异常，提示使用异步版本。
+        """
+        return self._run_async_from_sync(self._parse_image_async(path))
+
+    async def _parse_image_async(self, path: Path) -> ParsedDocument:
+        """
+        使用 GLM-OCR 视觉模型识别图片中的文字（异步实现）。
         """
         if not self.llm_gateway:
             raise DocumentParseError(
-                "图片识别需要配置 LLM 网关（视觉模型）"
+                "图片识别需要配置 LLM 网关（视觉模型 GLM-OCR）"
             )
 
         try:
-            # 读取图片并转 base64
             image_bytes = path.read_bytes()
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-            # 调用视觉模型
-            text = self._call_vision_model(base64_image, path.suffix)
+            text = await self._call_vision_model_async(image_bytes, path.suffix)
 
             return ParsedDocument(
                 text=text,
                 filename=path.name,
                 file_type=path.suffix.lower(),
-                parser_used="vision_model",
+                parser_used="vision_model_glm_ocr",
             )
         except DocumentParseError:
             raise
         except Exception as exc:
             raise DocumentParseError(f"图片识别失败：{exc}") from exc
 
+    @staticmethod
+    def _run_async_from_sync(coro):
+        """
+        在同步上下文中运行协程。
+
+        如果当前没有运行的事件循环，使用 asyncio.run。
+        如果已在事件循环内，抛出异常提示使用异步版本。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None:
+            raise DocumentParseError(
+                "当前处于异步上下文中，请使用 parse_bytes_async / "
+                "parse_file_structured_async 方法解析图片。"
+            )
+
+        return asyncio.run(coro)
+
+    async def _call_vision_model_async(self, image_bytes: bytes, ext: str) -> str:
+        """
+        调用 GLM-OCR 视觉模型识别图片文字。
+
+        使用 LLM 网关的 chat_with_vision 方法，传入图片字节，
+        返回识别到的文本内容。
+        """
+        if not self.llm_gateway:
+            raise DocumentParseError(
+                "视觉模型未配置：请在 LLM 网关中启用 GLM-OCR。"
+            )
+
+        prompt = (
+            "请识别并提取图片中的所有文字内容，保持原有格式和段落结构。"
+            "如果是合同或法律文档，请保留条款编号和层级关系。"
+        )
+        return await self.llm_gateway.chat_with_vision(
+            image=image_bytes,
+            prompt=prompt,
+        )
+
     def _call_vision_model(self, base64_image: str, ext: str) -> str:
         """
-        调用视觉模型识别图片文字。
+        调用视觉模型识别图片文字（同步兼容入口）。
 
-        预留接口，具体实现根据使用的视觉模型调整。
+        已废弃：请使用 _call_vision_model_async。
+        保留是为了向后兼容旧的同步调用路径。
         """
-        # 预留实现：调用视觉模型进行 OCR
-        # 实际项目中需要根据使用的视觉模型 API 来实现
+        try:
+            image_bytes = base64.b64decode(base64_image)
+        except Exception as exc:
+            raise DocumentParseError(f"base64 图片解码失败：{exc}") from exc
 
-        return (
-            "【图片识别功能】\n"
-            "图片识别需要配置视觉模型 API（如智谱 GLM-4V Flash）。\n"
-            "请在 .env 中配置 GLM-4V 的 API Key，并在 LLM 网关中添加视觉模型支持。\n"
-            "当前仅支持文本类合同（Word/PDF/TXT）的直接解析。"
+        return self._run_async_from_sync(
+            self._call_vision_model_async(image_bytes, ext)
         )
 
     # ========== MinIO 相关功能 ==========
@@ -802,12 +920,14 @@ class DocumentParser:
         }
 
 
-# 全局单例
-document_parser = DocumentParser()
+# 全局单例（注入 LLM 网关以支持 GLM-OCR 图片识别）
+from backend.core.llm_gateway import gateway as _default_gateway
+
+document_parser = DocumentParser(llm_gateway=_default_gateway)
 
 
 if __name__ == "__main__":
     # 简单测试
-    parser = DocumentParser()
+    parser = DocumentParser(llm_gateway=_default_gateway)
     print("文档解析器信息:")
     print(parser.get_parser_info())

@@ -48,9 +48,34 @@ pytest-of-*/
 # 临时测试脚本
 test_imports.py
 tmp_*.py
+test_output.txt
+test_api_output.txt
+tests/test_results.txt
+tests/888.txt
 
 # 前端自定义资源（保留 README 说明文件）
 frontend/assets/backgrounds/*
 !frontend/assets/backgrounds/README.md
 frontend/assets/music/*
 !frontend/assets/music/README.md
+
+# === v3.0 追加忽略规则 ===
+# Node.js 依赖与构建产物
+node_modules/
+frontend-next/node_modules/
+frontend-next/dist/
+*.pyc
+
+# 构建输出目录
+output/
+
+# 测试输出文件（仅保留 .py 测试脚本）
+tests/*.txt
+tests/sse_*.*
+tests/test_body.json
+tests/*_debug.txt
+tests/chat_test_result.txt
+tests/stream_debug.txt
+
+# Neo4j 运行时数据
+.neo4j*

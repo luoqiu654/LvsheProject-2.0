@@ -452,6 +452,9 @@ class Neo4jConnector:
 
         Returns:
             True 表示连接成功，False 表示失败（将使用内存fallback）
+
+        支持自动重连：如果之前连接失败，后续调用会重新尝试。
+        连接成功时会重置 _use_memory_fallback，让所有操作回到 Neo4j 模式。
         """
         if self._connected:
             return True
@@ -464,13 +467,24 @@ class Neo4jConnector:
         try:
             from neo4j import GraphDatabase
 
+            # 关闭旧的 driver（如果有），避免资源泄漏
+            if self._driver is not None:
+                try:
+                    self._driver.close()
+                except Exception:
+                    pass
+                self._driver = None
+
             self._driver = GraphDatabase.driver(
                 self.uri,
                 auth=(self.user, self.password),
+                connection_timeout=5.0,  # 5秒连接超时，避免 status 检查时长时间阻塞
+                max_connection_lifetime=3600,
             )
             # 测试连接
             self._driver.verify_connectivity()
             self._connected = True
+            self._use_memory_fallback = False  # 连接成功，重置回退标志
             print("[GraphRAG] Neo4j连接成功")
             return True
 
@@ -492,7 +506,7 @@ class Neo4jConnector:
 
     def add_node(self, node: GraphNode) -> None:
         """添加节点。"""
-        if self._use_memory_fallback or not self.connect():
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             self._memory_nodes[node.node_id] = node
             return
 
@@ -526,7 +540,7 @@ class Neo4jConnector:
 
     def add_relation(self, relation: GraphRelation) -> None:
         """添加关系。"""
-        if self._use_memory_fallback or not self.connect():
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             self._memory_relations.append(relation)
             return
 
@@ -562,7 +576,7 @@ class Neo4jConnector:
 
     def search_similar_cases(self, query: str, limit: int = 5) -> list[GraphNode]:
         """搜索相似案例。"""
-        if self._use_memory_fallback or not self.connect():
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             return self._memory_search(query, node_type="Case", limit=limit)
 
         try:
@@ -598,7 +612,7 @@ class Neo4jConnector:
 
     def search_related_laws(self, query: str, limit: int = 5) -> list[GraphNode]:
         """搜索相关法律。"""
-        if self._use_memory_fallback or not self.connect():
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             return self._memory_search(query, node_type="Law", limit=limit)
 
         try:
@@ -636,7 +650,7 @@ class Neo4jConnector:
         limit: int = 10,
     ) -> tuple[list[GraphNode], list[GraphRelation]]:
         """获取关联节点。"""
-        if self._use_memory_fallback or not self.connect():
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             return self._memory_get_related(node_id, relation_type, limit)
 
         # Neo4j实现
@@ -715,15 +729,27 @@ class Neo4jConnector:
 
     def count_nodes(self) -> int:
         """统计节点数。"""
-        if self._use_memory_fallback:
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             return len(self._memory_nodes)
-        return 0  # Neo4j版本需实现
+        try:
+            with self._driver.session(database=self.database) as session:
+                result = session.run("MATCH (n) RETURN count(n) AS cnt")
+                return result.single()["cnt"]
+        except Exception as exc:
+            print(f"[GraphRAG] 统计节点失败: {exc}")
+            return 0
 
     def count_relations(self) -> int:
         """统计关系数。"""
-        if self._use_memory_fallback:
+        if not self.connect():  # 每次都尝试连接，支持自动重连
             return len(self._memory_relations)
-        return 0
+        try:
+            with self._driver.session(database=self.database) as session:
+                result = session.run("MATCH ()-[r]->() RETURN count(r) AS cnt")
+                return result.single()["cnt"]
+        except Exception as exc:
+            print(f"[GraphRAG] 统计关系失败: {exc}")
+            return 0
 
 
 # ========== Graph RAG主类 ==========
@@ -980,7 +1006,10 @@ class GraphRAG:
             return "未找到相关节点"
 
     def get_stats(self) -> dict[str, Any]:
-        """获取图谱统计信息。"""
+        """获取图谱统计信息。每次调用都会尝试重连Neo4j，确保状态最新。"""
+        # 主动尝试重连（如果之前失败）
+        if not self.connector.is_connected:
+            self.connector.connect()
         return {
             "nodes": self.connector.count_nodes(),
             "relations": self.connector.count_relations(),

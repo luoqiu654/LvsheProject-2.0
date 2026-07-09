@@ -239,7 +239,7 @@ class SkillExecutor:
             output = await self._execute_law_search(input_text)
 
         elif skill.name == "contract-risk-review":
-            output = await self._execute_contract_risk_review(input_text)
+            output = await self._execute_contract_risk_review(input_text, use_llm=use_llm)
 
         elif skill.name == "legal-consultation":
             output = await self._execute_legal_consultation(input_text, use_llm=use_llm)
@@ -297,14 +297,14 @@ class SkillExecutor:
 
         return "\n".join(lines)
 
-    async def _execute_contract_risk_review(self, input_text: str) -> str:
+    async def _execute_contract_risk_review(self, input_text: str, use_llm: bool = True) -> str:
         """
         合同风险审查 Skill。
 
-        这里直接复用 LegalAgent 内部的合同风险规则，
-        后续可以进一步拆分为独立规则引擎。
+        先用规则引擎做初筛，再调用 LLM 生成专业审查建议。
         """
-        result = self.legal_agent._tool_contract_risk_check(input_text)
+        # 步骤1：规则引擎初筛
+        rule_result = self.legal_agent._tool_contract_risk_check(input_text)
 
         checklist_path = (
             self.registry.get("contract-risk-review").path
@@ -312,13 +312,46 @@ class SkillExecutor:
             / "review_checklist.md"
         )
 
+        checklist_note = ""
         if checklist_path.exists():
-            result += (
+            checklist_note = (
                 "\n\n已参考技能资源："
                 f"{checklist_path.relative_to(PROJECT_ROOT)}"
             )
 
-        return result
+        # 步骤2：调用 LLM 生成专业审查建议
+        if use_llm:
+            try:
+                from backend.core.llm_gateway import gateway as default_gateway
+
+                prompt = f"""你是专业合同法律师。请对以下合同内容进行风险审查，给出专业分析和修改建议。
+
+合同内容：
+{input_text}
+
+规则引擎初筛结果：
+{rule_result}
+
+请按以下格式输出：
+1. 风险概述（总体评价）
+2. 具体风险点（按严重程度排序，标注高/中/低风险）
+3. 修改建议（针对每个风险点给出具体修改意见）
+4. 补充条款建议（如有必要）
+
+注意：不要编造法条编号，结尾提醒复杂情况咨询专业律师。""".strip()
+
+                llm_advice = await default_gateway.chat_text(
+                    user_message=prompt,
+                    system_message="你是专业、严谨的合同法律师，不会编造法条。",
+                    max_tokens=2000,
+                    temperature=0.3,
+                )
+                return f"{llm_advice}{checklist_note}"
+            except Exception as exc:
+                # LLM 失败时回退到规则结果
+                return f"⚠️ LLM 分析失败（{exc}），以下为规则引擎初筛结果：\n\n{rule_result}{checklist_note}"
+
+        return f"{rule_result}{checklist_note}"
 
     async def _execute_legal_consultation(
         self,
@@ -327,13 +360,34 @@ class SkillExecutor:
     ) -> str:
         result = await self.legal_agent.run(input_text, use_llm=use_llm)
 
-        return (
-            f"执行工具：{result.tool_name}\n\n"
-            f"执行步骤：\n"
-            + "\n".join(f"- {step}" for step in result.steps)
-            + "\n\n"
-            f"最终回答：\n{result.final_answer}"
-        )
+        # 只返回最终回答，调度详情（工具名、步骤等）不混入回答
+        # 如果 final_answer 为空或是 fallback（以"结论：我已根据问题调用工具"开头），
+        # 尝试用 LLM 重新生成
+        final_answer = result.final_answer
+        if (
+            not final_answer.strip()
+            or final_answer.startswith("结论：我已根据问题调用工具")
+        ):
+            if use_llm:
+                try:
+                    from backend.core.llm_gateway import gateway as default_gateway
+
+                    tool_context = result.tool_result or ""
+                    prompt = (
+                        f"你是专业法律顾问。请回答以下问题：\n\n{input_text}\n\n"
+                        + (f"参考信息：\n{tool_context}\n\n" if tool_context else "")
+                        + "要求：先给结论，再说明依据，最后给出建议。不要编造法条编号。"
+                    )
+                    final_answer = await default_gateway.chat_text(
+                        user_message=prompt,
+                        system_message="你是专业、严谨的法律顾问，不会编造法条。",
+                        max_tokens=1500,
+                        temperature=0.3,
+                    )
+                except Exception:
+                    pass  # 保留原始 final_answer
+
+        return final_answer
 
     def _list_resources(self, skill_path: Path) -> list[str]:
         resources: list[str] = []

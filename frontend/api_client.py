@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from typing import Any, Optional
 
 import requests
@@ -368,6 +367,63 @@ class LvsheAPIClient:
     def graph_rag_stats(self) -> dict[str, Any]:
         """获取知识图谱统计。"""
         return self._get("/api/graph-rag/stats")
+
+    # ========== 视觉模型（GLM-OCR）与图像生成（GLM-Image）相关 ==========
+
+    def models_info(self) -> dict[str, Any]:
+        """获取所有可用模型信息。"""
+        return self._get("/api/models")
+
+    def vision_analyze(self, image_base64: str, prompt: str = "请识别并提取图片中的所有文字内容。") -> dict[str, Any]:
+        """使用 GLM-OCR 视觉模型识别图片文字（base64 方式）。"""
+        return self._post(
+            "/api/vision/analyze",
+            {
+                "image_base64": image_base64,
+                "prompt": prompt,
+            },
+        )
+
+    def vision_analyze_file(self, file_bytes: bytes, filename: str, prompt: str = "请识别并提取图片中的所有文字内容。") -> dict[str, Any]:
+        """上传图片文件，使用 GLM-OCR 视觉模型识别文字。"""
+        try:
+            files = {"file": (filename, file_bytes)}
+            response = requests.post(
+                self.base_url + "/api/vision/analyze-file",
+                files=files,
+                data={"prompt": prompt},
+                timeout=self.timeout,
+            )
+            return self._handle_response(response)
+        except requests.RequestException as exc:
+            raise APIClientError(f"请求后端失败：{exc}") from exc
+
+    def image_generate(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        n: int = 1,
+        user_id: str = "default",
+    ) -> dict[str, Any]:
+        """使用 GLM-Image 模型生成图片。"""
+        return self._post(
+            "/api/image/generate",
+            {
+                "prompt": prompt,
+                "size": size,
+                "n": n,
+                "user_id": user_id,
+            },
+        )
+
+    def image_download_url(self, filename: str, user_id: str = "default") -> str:
+        """获取生成图片的下载URL。"""
+        return f"{self.base_url}/api/image/download?filename={filename}&user_id={user_id}"
+
+    def llm_health_check(self, model: str | None = None) -> dict[str, Any]:
+        """LLM 网关健康检查。"""
+        params = f"?model={model}" if model else ""
+        return self._get(f"/api/llm/health{params}")
 
     def _handle_response(self, response: requests.Response) -> dict[str, Any]:
         if response.status_code >= 400:

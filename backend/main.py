@@ -4,6 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes import router
+from backend.api.contract_routes import router as contract_router
+from backend.api.expert_routes import router as expert_router
 from backend.config import settings
 
 
@@ -22,6 +24,8 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(contract_router)
+app.include_router(expert_router)
 
 
 @app.get("/health")

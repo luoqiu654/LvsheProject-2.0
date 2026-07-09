@@ -35,34 +35,31 @@ class Settings(BaseSettings):
     backend_host: str = Field(default="127.0.0.1", alias="BACKEND_HOST")
     backend_port: int = Field(default=8000, alias="BACKEND_PORT")
 
-    # LLM default
-    default_llm_provider: str = Field(default="qwen", alias="DEFAULT_LLM_PROVIDER")
-    default_llm_model: str = Field(default="qwen3.7-plus", alias="DEFAULT_LLM_MODEL")
-
-    # Qwen
-    qwen_api_key: Optional[SecretStr] = Field(default=None, alias="QWEN_API_KEY")
-    qwen_base_url: Optional[str] = Field(default=None, alias="QWEN_BASE_URL")
-
-    # Zhipu GLM
+    # ===== 智谱 AI 统一配置 =====
+    # 所有 6 个模型共用同一个 API Key 和 Base URL
     zhipu_api_key: Optional[SecretStr] = Field(default=None, alias="ZHIPU_API_KEY")
     zhipu_base_url: str = Field(
         default="https://open.bigmodel.cn/api/paas/v4",
         alias="ZHIPU_BASE_URL",
     )
 
-    # SiliconFlow
-    siliconflow_api_key: Optional[SecretStr] = Field(
-        default=None,
-        alias="SILICONFLOW_API_KEY",
-    )
-    siliconflow_base_url: str = Field(
-        default="https://api.siliconflow.cn/v1",
-        alias="SILICONFLOW_BASE_URL",
+    # 默认语言模型（4 个文本模型可选：glm-4.7-flash / glm-4.7-flashx / glm-4.6 / glm-5.2）
+    default_llm_model: str = Field(default="glm-4.7-flash", alias="DEFAULT_LLM_MODEL")
+
+    # 语言模型清单（逗号分隔，用于前端模型选择和校验）
+    zhipu_chat_models: str = Field(
+        default="glm-4.7-flash,glm-4.7-flashx,glm-4.6,glm-5.2",
+        alias="ZHIPU_CHAT_MODELS",
     )
 
-    # Doubao
-    doubao_api_key: Optional[SecretStr] = Field(default=None, alias="DOUBAO_API_KEY")
-    doubao_base_url: Optional[str] = Field(default=None, alias="DOUBAO_BASE_URL")
+    # 文档分析视觉模型（GLM-OCR，用于图片/扫描件文字识别）
+    zhipu_vision_model: str = Field(default="glm-ocr", alias="ZHIPU_VISION_MODEL")
+
+    # 文档批注与图片生成模型（GLM-Image）
+    zhipu_image_model: str = Field(default="glm-image", alias="ZHIPU_IMAGE_MODEL")
+
+    # 兼容旧代码：provider 概念已废弃，保留 default_llm_provider 为 "zhipu"
+    default_llm_provider: str = Field(default="zhipu", alias="DEFAULT_LLM_PROVIDER")
 
     # ChromaDB
     chroma_persist_dir: str = Field(default="data/vector_store", alias="CHROMA_PERSIST_DIR")
@@ -142,6 +139,16 @@ class Settings(BaseSettings):
     def image_chroma_path(self) -> Path:
         return PROJECT_ROOT / "data" / "image_vector_store"
 
+    @property
+    def chat_models_list(self) -> list[str]:
+        """返回可用的文本模型列表。"""
+        return [m.strip() for m in self.zhipu_chat_models.split(",") if m.strip()]
+
+    @property
+    def has_zhipu_api_key_value(self) -> bool:
+        """是否已配置智谱 API Key。"""
+        return self.zhipu_api_key is not None and bool(self.zhipu_api_key.get_secret_value())
+
     def safe_summary(self) -> dict:
         """
         返回不会泄露密钥的配置摘要。
@@ -154,10 +161,10 @@ class Settings(BaseSettings):
             "backend": f"{self.backend_host}:{self.backend_port}",
             "default_llm_provider": self.default_llm_provider,
             "default_llm_model": self.default_llm_model,
-            "has_qwen_api_key": self.qwen_api_key is not None and bool(self.qwen_api_key.get_secret_value()),
-            "has_zhipu_api_key": self.zhipu_api_key is not None and bool(self.zhipu_api_key.get_secret_value()),
-            "has_siliconflow_api_key": self.siliconflow_api_key is not None and bool(self.siliconflow_api_key.get_secret_value()),
-            "has_doubao_api_key": self.doubao_api_key is not None and bool(self.doubao_api_key.get_secret_value()),
+            "has_zhipu_api_key": self.has_zhipu_api_key_value,
+            "chat_models": self.chat_models_list,
+            "vision_model": self.zhipu_vision_model,
+            "image_model": self.zhipu_image_model,
             "chroma_path": str(self.chroma_path),
             "upload_path": str(self.upload_path),
             "memory_path": str(self.memory_path),

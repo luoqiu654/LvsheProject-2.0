@@ -26,20 +26,31 @@ with st.sidebar:
     st.header("⚙️ 系统设置")
     api_base_url = st.text_input("后端地址", value="http://127.0.0.1:8000")
 
+# 先创建 client，后续侧边栏和主区域都需要用到
+client = LvsheAPIClient(base_url=api_base_url)
+
+with st.sidebar:
     st.divider()
     st.subheader("🤖 模型选择")
-    # 获取可用模型列表
+    # 获取可用模型列表（4 个 GLM 文本模型）
     try:
         temp_client = LvsheAPIClient(base_url=api_base_url)
         status_data = temp_client.status()
-        available_models = status_data.get("available_llm_providers", ["qwen", "glm"])
+        available_models = status_data.get(
+            "available_llm_providers",
+            ["glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-5.2"],
+        )
     except Exception:
-        available_models = ["qwen", "glm"]
+        available_models = ["glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-5.2"]
 
+    # 模型显示名映射
     model_display = {
-        "qwen": "千问 Qwen (通义千问)",
-        "glm": "智谱 GLM (质谱)",
+        "glm-4.7-flash": "GLM-4.7-Flash（轻量高速）",
+        "glm-4.7-flashx": "GLM-4.7-FlashX（轻量增强）",
+        "glm-4.6": "GLM-4.6（通用文本）",
+        "glm-5.2": "GLM-5.2（旗舰模型）",
     }
+    # 只显示已配置的模型，未匹配的保留原名
     model_options = [m for m in available_models if m in model_display]
     if not model_options:
         model_options = available_models
@@ -49,7 +60,7 @@ with st.sidebar:
         options=model_options,
         format_func=lambda x: model_display.get(x, x),
         index=0,
-        help="选择要使用的大语言模型",
+        help="选择要使用的智谱 GLM 文本模型",
     )
     st.info(f"当前使用：{model_display.get(selected_model, selected_model)}")
 
@@ -156,8 +167,6 @@ with st.sidebar:
         st.session_state.uploaded_file_contents = []
         st.rerun()
 
-client = LvsheAPIClient(base_url=api_base_url)
-
 # ========== 初始化会话历史 ==========
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -235,6 +244,9 @@ if prompt := st.chat_input("请输入你的法律问题..."):
             # ========== 步骤2：根据模式选择回答方式 ==========
             is_pure_chat = not enable_rag and not enable_agent
 
+            # 用于存放开发者调试信息
+            debug_info: dict = {}
+
             if is_pure_chat:
                 # 纯对话模式 - 真正的流式输出
                 if enable_stream:
@@ -244,20 +256,52 @@ if prompt := st.chat_input("请输入你的法律问题..."):
                     message_placeholder.markdown(full_response)
                 else:
                     chat_result = client.chat(prompt, provider=selected_model)
-                    full_response = chat_result["answer"]
+                    full_response = chat_result.get("answer", "")
                     message_placeholder.markdown(full_response)
 
             elif enable_agent:
-                # Agent 模式
+                # Agent 模式：先用 Agent 调用工具获取上下文，再确保 LLM 生成回答
                 with st.spinner("🤖 Agent 正在分析并调用工具..."):
                     agent_result = client.agent_run(
                         question=enhanced_question,
                         use_llm=True,
                     )
-                full_response = agent_result["final_answer"]
+                full_response = agent_result.get("final_answer", "")
+
+                # 检查 final_answer 是否是有效的 LLM 回答
+                # 如果是 _fallback_final_answer 的输出（以"结论：我已根据问题调用工具"开头），
+                # 说明 LLM 失败了，需要重新调用 LLM
+                is_invalid_fallback = (
+                    not full_response.strip()
+                    or full_response.startswith("结论：我已根据问题调用工具")
+                )
+
+                if is_invalid_fallback:
+                    # Agent 回答无效，用工具结果作为上下文，直接调用 LLM 生成回答
+                    with st.spinner("正在生成专业回复..."):
+                        tool_context = agent_result.get("tool_result", "")
+                        if tool_context and "无需调用" not in tool_context:
+                            enhanced_with_tool = (
+                                f"【Agent 工具检索结果】\n{tool_context}\n\n"
+                                f"【用户问题】\n{prompt}\n\n"
+                                f"请基于上述工具检索结果，以专业法律顾问的身份回答用户问题。"
+                                f"要求：先给结论，再说明依据，最后给出建议。"
+                            )
+                        else:
+                            enhanced_with_tool = enhanced_question
+
+                        try:
+                            chat_result = client.chat(
+                                enhanced_with_tool, provider=selected_model
+                            )
+                            full_response = chat_result.get("answer", "")
+                        except Exception:
+                            # chat 也失败，用 Agent 的原始回答
+                            if not full_response.strip():
+                                full_response = "抱歉，AI 服务暂时不可用，请稍后重试。"
 
                 # 流式显示效果
-                if enable_stream:
+                if enable_stream and full_response:
                     display_text = ""
                     for chunk in stream_text_generator(full_response, chunk_size=5):
                         display_text += chunk
@@ -266,20 +310,8 @@ if prompt := st.chat_input("请输入你的法律问题..."):
                 else:
                     message_placeholder.markdown(full_response)
 
-                # 显示 Agent 详情（可展开）
-                with st.expander("🔍 查看 Agent 执行详情"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**调用工具：**")
-                        st.code(agent_result["tool_name"])
-                        st.markdown("**工具输入：**")
-                        st.write(agent_result["tool_input"])
-                    with col2:
-                        st.markdown("**执行步骤：**")
-                        for step in agent_result["steps"]:
-                            st.write("- " + step)
-                    st.markdown("**工具原始结果：**")
-                    st.write(agent_result["tool_result"])
+                # 收集 Agent 调试信息（稍后折叠显示）
+                debug_info["agent"] = agent_result
 
             elif enable_rag:
                 # 纯 RAG 模式
@@ -291,10 +323,33 @@ if prompt := st.chat_input("请输入你的法律问题..."):
                         use_llm_hyde=True,
                         use_llm_answer=True,
                     )
-                full_response = rag_result["answer"]
+                full_response = rag_result.get("answer", "")
+
+                # 如果 RAG 返回空，回退到直接对话
+                if not full_response.strip():
+                    with st.spinner("正在生成回复..."):
+                        try:
+                            rag_context = "\n".join(
+                                ctx.get("enriched_text", "")
+                                for ctx in rag_result.get("contexts", [])
+                            )
+                            if rag_context:
+                                enhanced_with_rag = (
+                                    f"【法律知识库检索结果】\n{rag_context}\n\n"
+                                    f"【用户问题】\n{prompt}\n\n"
+                                    f"请基于上述检索结果回答用户问题。"
+                                )
+                            else:
+                                enhanced_with_rag = enhanced_question
+                            chat_result = client.chat(
+                                enhanced_with_rag, provider=selected_model
+                            )
+                            full_response = chat_result.get("answer", "")
+                        except Exception:
+                            full_response = "抱歉，AI 服务暂时不可用，请稍后重试。"
 
                 # 流式显示效果
-                if enable_stream:
+                if enable_stream and full_response:
                     display_text = ""
                     for chunk in stream_text_generator(full_response, chunk_size=5):
                         display_text += chunk
@@ -303,8 +358,29 @@ if prompt := st.chat_input("请输入你的法律问题..."):
                 else:
                     message_placeholder.markdown(full_response)
 
-                # 显示 RAG 检索详情
-                with st.expander("📚 查看检索详情"):
+                # 收集 RAG 调试信息
+                debug_info["rag"] = rag_result
+
+            # ========== 开发者调试信息（折叠显示） ==========
+            if debug_info.get("agent"):
+                agent_result = debug_info["agent"]
+                with st.expander("🔧 开发者详情：Agent 执行记录", expanded=False):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**调用工具：**")
+                        st.code(agent_result.get("tool_name", "无"))
+                        st.markdown("**工具输入：**")
+                        st.write(agent_result.get("tool_input", "无"))
+                    with col2:
+                        st.markdown("**执行步骤：**")
+                        for step in agent_result.get("steps", []):
+                            st.write("- " + step)
+                    st.markdown("**工具原始结果：**")
+                    st.write(agent_result.get("tool_result", "无"))
+
+            if debug_info.get("rag"):
+                rag_result = debug_info["rag"]
+                with st.expander("🔧 开发者详情：RAG 检索记录", expanded=False):
                     if rag_result.get("transformed_queries"):
                         st.markdown("**查询改写 (Query Transformation)：**")
                         for item in rag_result["transformed_queries"]:
@@ -313,15 +389,15 @@ if prompt := st.chat_input("请输入你的法律问题..."):
                         st.markdown("**HyDE 假设回答：**")
                         st.write(rag_result["hyde_answer"])
                     st.markdown("**检索到的资料：**")
-                    for idx, ctx in enumerate(rag_result["contexts"], start=1):
+                    for idx, ctx in enumerate(rag_result.get("contexts", []), start=1):
                         st.markdown(f"### 资料 {idx}")
-                        st.write(f"来源：{ctx['source']}")
-                        st.write(f"相关度分数：{ctx['final_score']}")
-                        st.write(ctx["enriched_text"])
+                        st.write(f"来源：{ctx.get('source', '未知')}")
+                        st.write(f"相关度分数：{ctx.get('final_score', 0)}")
+                        st.write(ctx.get("enriched_text", ""))
 
-            # ========== 显示记忆信息 ==========
-            if enable_memory and saved_memories:
-                with st.expander("🧠 记忆信息"):
+            # ========== 记忆信息（折叠显示） ==========
+            if enable_memory and (saved_memories or memory_context):
+                with st.expander("🧠 记忆信息（开发者）", expanded=False):
                     st.markdown("**本轮使用的记忆：**")
                     st.write(memory_context if memory_context else "暂无相关记忆")
                     st.markdown("**本轮保存的新记忆：**")
