@@ -314,7 +314,7 @@ def _render_docx_to_html(docx_path: Path) -> str:
         WD_COLOR_INDEX.RED: "#fecaca",
         WD_COLOR_INDEX.YELLOW: "#fef08a",
         WD_COLOR_INDEX.GREEN: "#bbf7d0",
-        WD_COLOR_INDEX.CYAN: "#a5f3fc",
+        WD_COLOR_INDEX.BRIGHT_GREEN: "#a5f3fc",
         WD_COLOR_INDEX.PINK: "#fbcfe8",
     }
 

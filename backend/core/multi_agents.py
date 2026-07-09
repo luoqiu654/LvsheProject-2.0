@@ -1,11 +1,19 @@
-"""法庭模拟专家会诊系统。
+"""法庭模拟专家会诊系统（交互式重写版）。
 
 核心类 ``CourtSimulator`` 模拟完整庭审流程：
-审判长开场 → 原告陈述 → 被告答辩 → 多轮辩论（含法官追问）→ 最终判决。
+审判长开场 → 原告陈述 → 被告答辩 → 多轮辩论（法官自主追问 + 用户询问）→ 最终判决。
 
-支持两种调用方式：
-1. ``run_trial`` — 非流式，返回完整 ``TrialResult``
-2. ``stream_trial`` — 流式，异步生成器 yield 每个角色的发言片段
+关键设计：
+1. 使用 ``gateway.chat_stream_with_reasoning`` 流式生成原被告发言
+   - reasoning_content → SSE ``thinking`` 事件（前端折叠展示）
+   - content → SSE ``speech`` 事件（正式发言）
+2. 法官用 ``gateway.chat`` 非流式判断是否追问（返回 JSON 决策）
+   - should_ask=false 时跳过追问，进入下一轮
+3. 被问方必须回答法官追问；若回答含"不清楚/不知道"等，触发用户询问
+   - 发送 ``user_question`` 事件，流暂停等待用户回答
+   - 用户回答后继续辩论
+4. 最终判决明确胜负，禁止"原告50%被告50%"端水判决
+   - 仅当用户也明确表示"不知道"时，才判"证据不足"
 
 向后兼容：保留 ``LegalMultiAgentDebate`` 供 ``backend/api/routes.py`` 使用。
 """
@@ -17,7 +25,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Optional
 
 from backend.core.llm_gateway import LLMGateway, LLMGatewayError, gateway as default_gateway
 
@@ -30,33 +38,67 @@ ROLE_DEFENDANT = "defendant"       # 被告
 ROLE_JUDGE = "judge"               # 中立法官
 ROLE_VERDICT = "verdict"           # 判决
 
+# 发言种类（用于区分陈述 / 追问 / 回答）
+KIND_OPENING = "opening"
+KIND_STATEMENT = "statement"       # 原被告陈述
+KIND_INQUIRY = "inquiry"           # 法官追问
+KIND_ANSWER = "answer"             # 原被告回答法官
+KIND_VERDICT = "verdict"
+KIND_USER = "user"                 # 用户回答
+
 # ========== System Prompts ==========
 
 SYSTEM_CHIEF_JUDGE = (
-    "你是庭审审判长，负责组织庭审秩序。根据案件描述，拆分案件核心事实，"
+    "你是庭审审判长（主Agent），负责组织庭审秩序与控制节奏。根据案件描述，拆分案件核心事实，"
     "分别向原告和被告介绍。用庄重威严的语气。"
+    "你同时也是用户与庭审之间的桥梁：当法官认为某项关键证据对判决有重大影响，"
+    "且原被告双方均无法确认是否能提供该证据时，由你向用户（当事人）发起询问，"
+    "让用户回答是否持有相关证据。"
 )
 
 SYSTEM_PLAINTIFF = (
-    "你是原告代理人，代表原告利益。基于案件事实陈述诉讼请求、事实和理由，"
-    "进行举证质证。用坚定有力的语气维护原告权益。"
+    "你是原告代理人。\n"
+    "1. 代表原告利益，坚定有力地陈述\n"
+    "2. 必须正面回答法官的追问，不得回避\n"
+    "3. 如果你方确实不清楚某个事实，如实回答\"不清楚此事，需要当事人确认\"\n"
+    "4. 引用法律条文支持你的主张"
 )
 
 SYSTEM_DEFENDANT = (
-    "你是被告代理人，代表被告利益。针对原告指控进行答辩，提出抗辩理由和证据。"
-    "用冷静理性的语气维护被告权益。"
+    "你是被告代理人。\n"
+    "1. 代表被告利益，坚定有力地陈述\n"
+    "2. 必须正面回答法官的追问，不得回避\n"
+    "3. 如果你方确实不清楚某个事实，如实回答\"不清楚此事，需要当事人确认\"\n"
+    "4. 引用法律条文支持你的主张"
 )
 
 SYSTEM_JUDGE = (
-    "你是中立法官，不偏袒任何一方。根据双方辩论内容和相关法律依据，"
-    "适时追问双方，最终做出公正判决。引用具体法律条文。"
+    "你是中立法官，正在审理一起案件。你的职责：\n"
+    "1. 仔细倾听原告和被告的辩论，发现矛盾点和证据薄弱环节\n"
+    "2. 主动追问，不要和稀泥。如果某方说法有漏洞，直接追问\n"
+    "3. 如果双方都无法确认关键事实，向用户询问补充信息\n"
+    "4. 只有当用户也表示不知道时，才判定证据不足\n"
+    "5. 最终判决要明确：谁胜诉、谁败诉、为什么、引用哪条法律\n"
+    "6. 不要给出\"原告50%被告50%\"这种端水判决\n"
+    "你是犀利、专业、公正的法官。"
 )
 
 # ========== 模型选择 ==========
 
-MODEL_OPENING = "glm-4.7-flash"    # 开场白（快速）
-MODEL_DEBATE = "glm-4.6"           # 辩论 / 追问（稳定）
-MODEL_VERDICT = "glm-5.2"          # 最终判决（旗舰）
+MODEL_SPEECH = "glm-4.7-flash"    # 陈述/回答（有思考过程可展示）
+MODEL_DECISION = "glm-4.6"        # 法官追问决策（稳定 JSON）
+MODEL_VERDICT = "glm-5.2"         # 最终判决（旗舰）
+
+# 当事人"不清楚"关键事实的关键词（触发向用户询问）
+UNCLEAR_PATTERNS = (
+    "不清楚", "不知道", "无法确认", "暂无此证据", "需要当事人确认",
+    "无法提供", "记不清", "不记得", "尚无证据", "无法核实",
+)
+
+# 用户明确表示"不知道"的关键词（触发证据不足判决）
+USER_UNKNOWN_PATTERNS = (
+    "不知道", "不清楚", "无法确认", "记不清", "不记得", "无从得知", "确实没有",
+)
 
 
 # ========== 新版数据结构 ==========
@@ -80,6 +122,23 @@ class TrialRound:
     plaintiff_speech: str
     defendant_speech: str
     judge_inquiry: str = ""
+    plaintiff_answer: str = ""
+    defendant_answer: str = ""
+    user_answer: str = ""
+
+
+@dataclass
+class JudgeDecision:
+    """法官追问决策（由 LLM 返回的 JSON 解析而来）。
+
+    should_ask: 是否追问。False 时跳过追问直接进入下一轮。
+    question: 法官追问的问题（should_ask=True 时填写）。
+    target: 追问对象 plaintiff / defendant / both。
+    """
+
+    should_ask: bool = False
+    question: str = ""
+    target: str = "both"
 
 
 @dataclass
@@ -120,6 +179,9 @@ class TrialResult:
                     "plaintiff_speech": r.plaintiff_speech,
                     "defendant_speech": r.defendant_speech,
                     "judge_inquiry": r.judge_inquiry,
+                    "plaintiff_answer": r.plaintiff_answer,
+                    "defendant_answer": r.defendant_answer,
+                    "user_answer": r.user_answer,
                 }
                 for r in self.rounds
             ],
@@ -210,16 +272,16 @@ class MultiAgentDebateResult:
 
 class CourtSimulator:
     """
-    法庭模拟专家会诊系统。
+    法庭模拟专家会诊系统（交互式重写版）。
 
     角色：
-    1. 审判长（主Agent）：拆分案件事实，控制庭审秩序，介绍案情
+    1. 审判长（主Agent）：拆分案件事实，控制庭审秩序
     2. 原告Agent：陈述诉讼请求、事实理由、举证质证
     3. 被告Agent：答辩、反诉、举证质证
-    4. 法官Agent：追问双方，最终判决
+    4. 法官Agent：自主追问双方，最终判决
 
     流程：
-    审判长开场 → 原告陈述 → 被告答辩 → [多轮辩论] → 法官最终判决
+    审判长开场 → 原告陈述 → 被告答辩 → [多轮辩论(法官自主追问)] → 法官最终判决
     """
 
     def __init__(self, llm_gateway: Optional[LLMGateway] = None) -> None:
@@ -246,7 +308,23 @@ class CourtSimulator:
             lines.append(f"被告：{r.defendant_speech[:500]}")
             if r.judge_inquiry:
                 lines.append(f"法官追问：{r.judge_inquiry[:400]}")
+            if r.plaintiff_answer:
+                lines.append(f"原告回答法官：{r.plaintiff_answer[:400]}")
+            if r.defendant_answer:
+                lines.append(f"被告回答法官：{r.defendant_answer[:400]}")
+            if r.user_answer:
+                lines.append(f"用户（当事人）补充证据：{r.user_answer[:400]}")
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _needs_user_input(answer: str) -> bool:
+        """检查回答是否表明当事人不清楚关键事实（需向用户询问）。"""
+        return any(p in answer for p in UNCLEAR_PATTERNS)
+
+    @staticmethod
+    def _is_user_unknown(user_answer: str) -> bool:
+        """用户是否明确表示不知道（触发证据不足判决）。"""
+        return any(p in user_answer for p in USER_UNKNOWN_PATTERNS)
 
     # ========== Prompt 构建 ==========
 
@@ -320,7 +398,7 @@ class CourtSimulator:
             f"用冷静理性的语气，字数 400-600 字。"
         )
 
-    def _judge_inquiry_prompt(
+    def _judge_decision_prompt(
         self,
         case: str,
         opening: str,
@@ -329,15 +407,82 @@ class CourtSimulator:
         plaintiff_speech: str,
         defendant_speech: str,
     ) -> str:
+        """法官判断是否需要追问。返回严格 JSON。"""
+        history = self._format_debate_history(rounds_so_far)
         return (
-            f"请作为中立法官，对第 {round_num} 轮辩论进行追问。\n\n"
+            f"你是中立法官，正在审理第 {round_num} 轮辩论。请判断是否需要追问。\n\n"
             f"案件描述：\n{case[:600]}\n\n"
             f"审判长开场白：\n{opening[:400]}\n\n"
+            f"之前辩论记录：\n{history[:800]}\n\n"
             f"原告本轮主张：\n{plaintiff_speech[:600]}\n\n"
             f"被告本轮抗辩：\n{defendant_speech[:600]}\n\n"
-            f"请针对双方辩论中的疑点、矛盾点或法律适用问题进行追问。\n"
-            f"可以追问原告、被告或双方。引用相关法律条文。\n"
-            f"字数 200-400 字。"
+            f"【判断原则】\n"
+            f"- 如果存在实质性疑点（证据链断裂、事实矛盾、法律适用争议、关键证据缺失），追问\n"
+            f"- 如果本轮已充分辩论、无实质疑点，不追问\n"
+            f"- 不要为了追问而追问，但也不要放过真正的疑点\n"
+            f"- 你是犀利法官，发现漏洞就要追问，不和稀泥\n\n"
+            f"请严格按以下 JSON 格式输出（不要输出其他文字、不要 markdown 代码块）：\n"
+            f'{{\n'
+            f'  "should_ask": true 或 false,\n'
+            f'  "question": "追问的问题（should_ask=true 时必填，要犀利、一针见血）",\n'
+            f'  "target": "plaintiff" 或 "defendant" 或 "both"\n'
+            f'}}'
+        )
+
+    def _plaintiff_answer_prompt(
+        self,
+        case: str,
+        opening: str,
+        round_num: int,
+        rounds_so_far: list[TrialRound],
+        plaintiff_speech: str,
+        defendant_speech: str,
+        judge_question: str,
+    ) -> str:
+        history = self._format_debate_history(rounds_so_far)
+        return (
+            f"你是原告代理人。法官在第 {round_num} 轮辩论后向你追问，"
+            f"你必须正面回答法官的问题。\n\n"
+            f"案件描述：\n{case[:500]}\n\n"
+            f"审判长开场白：\n{opening[:400]}\n\n"
+            f"之前辩论记录：\n{history[:600]}\n\n"
+            f"你本轮的陈述：\n{plaintiff_speech[:400]}\n\n"
+            f"被告本轮抗辩：\n{defendant_speech[:400]}\n\n"
+            f"【法官追问】\n{judge_question}\n\n"
+            f"请针对法官的追问正面回答：\n"
+            f"1. 直接回应法官的问题，不得回避\n"
+            f"2. 如有相关证据，说明证据内容\n"
+            f"3. 如确无相关证据或确实不清楚，明确表示\"不清楚此事，需要当事人确认\"\n"
+            f"4. 不得含糊其辞、不得顾左右而言他\n\n"
+            f"用坚定有力的语气，字数 200-400 字。"
+        )
+
+    def _defendant_answer_prompt(
+        self,
+        case: str,
+        opening: str,
+        round_num: int,
+        rounds_so_far: list[TrialRound],
+        plaintiff_speech: str,
+        defendant_speech: str,
+        judge_question: str,
+    ) -> str:
+        history = self._format_debate_history(rounds_so_far)
+        return (
+            f"你是被告代理人。法官在第 {round_num} 轮辩论后向你追问，"
+            f"你必须正面回答法官的问题。\n\n"
+            f"案件描述：\n{case[:500]}\n\n"
+            f"审判长开场白：\n{opening[:400]}\n\n"
+            f"之前辩论记录：\n{history[:600]}\n\n"
+            f"原告本轮主张：\n{plaintiff_speech[:400]}\n\n"
+            f"你本轮的抗辩：\n{defendant_speech[:400]}\n\n"
+            f"【法官追问】\n{judge_question}\n\n"
+            f"请针对法官的追问正面回答：\n"
+            f"1. 直接回应法官的问题，不得回避\n"
+            f"2. 如有相关证据，说明证据内容\n"
+            f"3. 如确无相关证据或确实不清楚，明确表示\"不清楚此事，需要当事人确认\"\n"
+            f"4. 不得含糊其辞、不得顾左右而言他\n\n"
+            f"用冷静理性的语气，字数 200-400 字。"
         )
 
     def _verdict_prompt(
@@ -345,14 +490,33 @@ class CourtSimulator:
         case: str,
         opening: str,
         rounds: list[TrialRound],
+        user_said_unknown: bool = False,
     ) -> str:
         debate = self._format_debate_history(rounds)
+        if user_said_unknown:
+            evidence_note = (
+                "【关键提示】当事人（用户）在庭审中明确表示对关键事实\"不清楚/不知道\"，"
+                "关键证据无法确认。因此现有证据不足以做出明确判决。\n"
+                "请在判决中：\n"
+                "1. winner 设为\"无法判断\"\n"
+                "2. 说明为何证据不足（哪些关键事实无法确认）\n"
+                "3. 给出现有证据下的倾向性意见（哪一方更有可能胜诉）\n"
+                "4. 建议当事人补充哪些证据后再行诉讼\n"
+            )
+        else:
+            evidence_note = (
+                "【关键提示】证据充分，必须给出明确判决。\n"
+                "1. winner 只能是\"原告\"或\"被告\"（或\"部分支持\"并说明哪部分）\n"
+                "2. 禁止\"原告50%被告50%\"这种端水判决\n"
+                "3. 必须明确谁胜诉、谁败诉、为什么、引用哪条法律\n"
+            )
         return (
             f"请作为中立法官，综合案件事实和多轮辩论，做出最终判决。\n\n"
             f"案件描述：\n{case}\n\n"
             f"审判长开场白：\n{opening[:500]}\n\n"
             f"完整辩论记录：\n{debate}\n\n"
-            f"请严格按照以下 JSON 格式输出（不要输出其他文字）：\n"
+            f"{evidence_note}\n"
+            f"请严格按照以下 JSON 格式输出（不要输出其他文字、不要 markdown 代码块）：\n"
             f'{{\n'
             f'  "winner": "原告"或"被告"或"部分支持"或"无法判断",\n'
             f'  "plaintiff_win_rate": 0-100 的数字,\n'
@@ -360,8 +524,8 @@ class CourtSimulator:
             f'  "key_points": ["关键胜负点1", "关键胜负点2", "关键胜负点3"],\n'
             f'  "reasoning": "详细的判决理由，分析双方主张和抗辩的合理性",\n'
             f'  "action_suggestions": ["建议1", "建议2", "建议3"],\n'
-            f'  "verdict_text": "完整的判决书文本，包括首部、事实认定、'
-            f'本院认为、判决主文等，用 Markdown 格式，500-1000 字"\n'
+            f'  "verdict_text": "完整的判决书文本，包括首部、事实认定、本院认为、'
+            f'判决主文等，用 Markdown 格式，500-1000 字，必须引用具体法律条文"\n'
             f'}}\n\n'
             f"要求：\n"
             f'1. winner 只能是"原告"、"被告"、"部分支持"、"无法判断"之一\n'
@@ -373,14 +537,91 @@ class CourtSimulator:
             f"7. 不要编造法条编号"
         )
 
-    # ========== 非流式生成 ==========
+    def _build_user_question(
+        self, role: str, answer: str, judge_question: str, round_num: int,
+    ) -> tuple[str, str]:
+        """构造向用户询问的问题和上下文。"""
+        role_label = "原告" if role == "plaintiff" else "被告"
+        question = (
+            f"法官追问：{judge_question[:200]}\n\n"
+            f"{role_label}代理人回答：\"{answer[:300]}\"\n\n"
+            f"由于{role_label}方对上述关键事实不清楚，请您（当事人）确认相关情况："
+            f"您是否持有相关证据？事实经过究竟如何？请详细说明。"
+        )
+        context = (
+            f"第 {round_num} 轮辩论中，法官就关键事实追问{role_label}方，"
+            f"但{role_label}方表示不清楚。该事实对判决有重大影响，"
+            f"需要您（当事人）提供补充信息以做出公正判决。"
+            f"若您也不清楚，请在回答中明确说明。"
+        )
+        return question, context
+
+    # ========== 流式发言（含 reasoning）==========
+
+    async def _stream_role_speech(
+        self,
+        messages: list[dict[str, str]],
+        role: str,
+        kind: str,
+        model: str,
+        round_num: int,
+        temperature: float = 0.6,
+        max_tokens: int = 1000,
+        fallback_text: str = "",
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """
+        流式生成角色发言，yield thinking / speech / speech_end 事件。
+
+        - reasoning_content → ``thinking`` 事件（前端折叠展示）
+        - content → ``speech`` 事件（正式发言）
+        - 最后 yield ``speech_end`` 标记发言结束
+        """
+        try:
+            async for typ, text in self.gateway.chat_stream_with_reasoning(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ):
+                if typ == "reasoning":
+                    yield {
+                        "type": "thinking",
+                        "role": role,
+                        "text": text,
+                        "round": round_num,
+                    }
+                else:  # content
+                    yield {
+                        "type": "speech",
+                        "role": role,
+                        "text": text,
+                        "kind": kind,
+                        "round": round_num,
+                    }
+        except LLMGatewayError:
+            if fallback_text:
+                yield {
+                    "type": "speech",
+                    "role": role,
+                    "text": fallback_text,
+                    "kind": kind,
+                    "round": round_num,
+                }
+        yield {
+            "type": "speech_end",
+            "role": role,
+            "kind": kind,
+            "round": round_num,
+        }
+
+    # ========== 非流式生成（供 run_trial 使用）==========
 
     async def _gen_opening(self, case: str) -> str:
         try:
             return await self.gateway.chat_text(
                 user_message=self._opening_prompt(case),
                 system_message=SYSTEM_CHIEF_JUDGE,
-                model=MODEL_OPENING,
+                model=MODEL_SPEECH,
                 temperature=0.5,
                 max_tokens=1200,
             )
@@ -398,7 +639,7 @@ class CourtSimulator:
             return await self.gateway.chat_text(
                 user_message=self._plaintiff_prompt(case, opening, round_num, rounds_so_far),
                 system_message=SYSTEM_PLAINTIFF,
-                model=MODEL_DEBATE,
+                model=MODEL_SPEECH,
                 temperature=0.6,
                 max_tokens=1000,
             )
@@ -419,14 +660,40 @@ class CourtSimulator:
                     case, opening, round_num, rounds_so_far, plaintiff_speech,
                 ),
                 system_message=SYSTEM_DEFENDANT,
-                model=MODEL_DEBATE,
+                model=MODEL_SPEECH,
                 temperature=0.6,
                 max_tokens=1000,
             )
         except LLMGatewayError:
             return self._fallback_speech("defendant", case, round_num)
 
-    async def _gen_judge_inquiry(
+    # ---------- 法官决策 / 回答 ----------
+
+    def _parse_judge_decision(self, text: str) -> JudgeDecision:
+        """从 LLM 返回的 JSON 文本中解析法官追问决策。"""
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
+            raw = re.sub(r"```$", "", raw).strip()
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return JudgeDecision(should_ask=False)
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return JudgeDecision(should_ask=False)
+
+        should_ask = bool(data.get("should_ask", False))
+        target = str(data.get("target", "both")).lower()
+        if target not in ("plaintiff", "defendant", "both"):
+            target = "both"
+        return JudgeDecision(
+            should_ask=should_ask,
+            question=str(data.get("question", "")) if should_ask else "",
+            target=target,
+        )
+
+    async def _gen_judge_decision(
         self,
         case: str,
         opening: str,
@@ -434,20 +701,105 @@ class CourtSimulator:
         rounds_so_far: list[TrialRound],
         plaintiff_speech: str,
         defendant_speech: str,
+    ) -> JudgeDecision:
+        """非流式调用 gateway.chat 让法官判断是否追问。"""
+        try:
+            response = await self.gateway.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_JUDGE},
+                    {"role": "user", "content": self._judge_decision_prompt(
+                        case, opening, round_num, rounds_so_far,
+                        plaintiff_speech, defendant_speech,
+                    )},
+                ],
+                model=MODEL_DECISION,
+                temperature=0.2,
+                max_tokens=600,
+            )
+            text = self.gateway.extract_text(response)
+            decision = self._parse_judge_decision(text)
+            if decision.should_ask and not decision.question.strip():
+                decision.should_ask = False
+            return decision
+        except LLMGatewayError:
+            return JudgeDecision(should_ask=False)
+
+    async def _gen_plaintiff_answer(
+        self,
+        case: str,
+        opening: str,
+        round_num: int,
+        rounds_so_far: list[TrialRound],
+        plaintiff_speech: str,
+        defendant_speech: str,
+        judge_question: str,
     ) -> str:
         try:
             return await self.gateway.chat_text(
-                user_message=self._judge_inquiry_prompt(
+                user_message=self._plaintiff_answer_prompt(
                     case, opening, round_num, rounds_so_far,
-                    plaintiff_speech, defendant_speech,
+                    plaintiff_speech, defendant_speech, judge_question,
                 ),
-                system_message=SYSTEM_JUDGE,
-                model=MODEL_DEBATE,
-                temperature=0.4,
-                max_tokens=600,
+                system_message=SYSTEM_PLAINTIFF,
+                model=MODEL_SPEECH,
+                temperature=0.5,
+                max_tokens=700,
             )
         except LLMGatewayError:
-            return self._fallback_speech("judge", case, round_num)
+            return "（原告暂无回应，LLM 不可用）"
+
+    async def _gen_defendant_answer(
+        self,
+        case: str,
+        opening: str,
+        round_num: int,
+        rounds_so_far: list[TrialRound],
+        plaintiff_speech: str,
+        defendant_speech: str,
+        judge_question: str,
+    ) -> str:
+        try:
+            return await self.gateway.chat_text(
+                user_message=self._defendant_answer_prompt(
+                    case, opening, round_num, rounds_so_far,
+                    plaintiff_speech, defendant_speech, judge_question,
+                ),
+                system_message=SYSTEM_DEFENDANT,
+                model=MODEL_SPEECH,
+                temperature=0.5,
+                max_tokens=700,
+            )
+        except LLMGatewayError:
+            return "（被告暂无回应，LLM 不可用）"
+
+    async def _gen_verdict_structured(
+        self,
+        case: str,
+        opening: str,
+        rounds: list[TrialRound],
+        user_said_unknown: bool = False,
+    ) -> tuple[Verdict, str]:
+        """非流式生成判决，返回 (Verdict, reasoning_text)。"""
+        try:
+            response = await self.gateway.chat(
+                messages=[
+                    {"role": "system", "content": SYSTEM_JUDGE},
+                    {"role": "user", "content": self._verdict_prompt(
+                        case, opening, rounds, user_said_unknown,
+                    )},
+                ],
+                model=MODEL_VERDICT,
+                temperature=0.2,
+                max_tokens=2000,
+            )
+            reasoning = self.gateway.extract_reasoning(response)
+            text = self.gateway.extract_text(response)
+            verdict = self._parse_verdict(text, case)
+            if not verdict.full_text:
+                verdict.full_text = text
+            return verdict, reasoning
+        except LLMGatewayError:
+            return self._fallback_verdict(case), ""
 
     async def _gen_verdict(
         self,
@@ -455,142 +807,20 @@ class CourtSimulator:
         opening: str,
         rounds: list[TrialRound],
     ) -> Verdict:
-        try:
-            text = await self.gateway.chat_text(
-                user_message=self._verdict_prompt(case, opening, rounds),
-                system_message=SYSTEM_JUDGE,
-                model=MODEL_VERDICT,
-                temperature=0.2,
-                max_tokens=2000,
-            )
-            return self._parse_verdict(text, case)
-        except LLMGatewayError:
-            return self._fallback_verdict(case)
-
-    # ========== 流式生成 ==========
-
-    async def _stream_opening(self, case: str) -> AsyncGenerator[str, None]:
-        try:
-            async for chunk in self.gateway.chat_stream(
-                messages=[
-                    {"role": "system", "content": SYSTEM_CHIEF_JUDGE},
-                    {"role": "user", "content": self._opening_prompt(case)},
-                ],
-                model=MODEL_OPENING,
-                temperature=0.5,
-                max_tokens=1200,
-            ):
-                yield chunk
-        except LLMGatewayError:
-            yield self._fallback_opening(case)
-
-    async def _stream_plaintiff(
-        self,
-        case: str,
-        opening: str,
-        round_num: int,
-        rounds_so_far: list[TrialRound],
-    ) -> AsyncGenerator[str, None]:
-        try:
-            async for chunk in self.gateway.chat_stream(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PLAINTIFF},
-                    {"role": "user", "content": self._plaintiff_prompt(
-                        case, opening, round_num, rounds_so_far,
-                    )},
-                ],
-                model=MODEL_DEBATE,
-                temperature=0.6,
-                max_tokens=1000,
-            ):
-                yield chunk
-        except LLMGatewayError:
-            yield self._fallback_speech("plaintiff", case, round_num)
-
-    async def _stream_defendant(
-        self,
-        case: str,
-        opening: str,
-        round_num: int,
-        rounds_so_far: list[TrialRound],
-        plaintiff_speech: str,
-    ) -> AsyncGenerator[str, None]:
-        try:
-            async for chunk in self.gateway.chat_stream(
-                messages=[
-                    {"role": "system", "content": SYSTEM_DEFENDANT},
-                    {"role": "user", "content": self._defendant_prompt(
-                        case, opening, round_num, rounds_so_far, plaintiff_speech,
-                    )},
-                ],
-                model=MODEL_DEBATE,
-                temperature=0.6,
-                max_tokens=1000,
-            ):
-                yield chunk
-        except LLMGatewayError:
-            yield self._fallback_speech("defendant", case, round_num)
-
-    async def _stream_judge_inquiry(
-        self,
-        case: str,
-        opening: str,
-        round_num: int,
-        rounds_so_far: list[TrialRound],
-        plaintiff_speech: str,
-        defendant_speech: str,
-    ) -> AsyncGenerator[str, None]:
-        try:
-            async for chunk in self.gateway.chat_stream(
-                messages=[
-                    {"role": "system", "content": SYSTEM_JUDGE},
-                    {"role": "user", "content": self._judge_inquiry_prompt(
-                        case, opening, round_num, rounds_so_far,
-                        plaintiff_speech, defendant_speech,
-                    )},
-                ],
-                model=MODEL_DEBATE,
-                temperature=0.4,
-                max_tokens=600,
-            ):
-                yield chunk
-        except LLMGatewayError:
-            yield self._fallback_speech("judge", case, round_num)
-
-    async def _stream_verdict_text(
-        self,
-        case: str,
-        opening: str,
-        rounds: list[TrialRound],
-    ) -> AsyncGenerator[str, None]:
-        """流式生成判决书文本。"""
-        try:
-            async for chunk in self.gateway.chat_stream(
-                messages=[
-                    {"role": "system", "content": SYSTEM_JUDGE},
-                    {"role": "user", "content": self._verdict_prompt(case, opening, rounds)},
-                ],
-                model=MODEL_VERDICT,
-                temperature=0.2,
-                max_tokens=2000,
-            ):
-                yield chunk
-        except LLMGatewayError:
-            yield self._fallback_verdict(case).full_text
+        """非流式生成判决（供 run_trial 使用）。"""
+        verdict, _ = await self._gen_verdict_structured(case, opening, rounds)
+        return verdict
 
     # ========== 解析 / Fallback ==========
 
     def _parse_verdict(self, text: str, case: str) -> Verdict:
         """从 LLM 返回的 JSON 文本中解析判决。"""
         raw = text.strip()
-        # 去掉 markdown 代码块
         if raw.startswith("```"):
             raw = re.sub(r"^```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
             raw = re.sub(r"```$", "", raw).strip()
-        # 提取 JSON 对象
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not match:
-            # 无法解析，用原始文本作为 full_text
             return self._fallback_verdict(case, raw)
         try:
             data = json.loads(match.group(0))
@@ -649,7 +879,19 @@ class CourtSimulator:
             f"案件：{case[:200]}"
         )
 
-    # ========== 主入口：非流式 ==========
+    @staticmethod
+    def _verdict_to_dict(verdict: Verdict) -> dict[str, Any]:
+        return {
+            "winner": verdict.winner,
+            "plaintiff_win_rate": verdict.plaintiff_win_rate,
+            "defendant_win_rate": verdict.defendant_win_rate,
+            "key_points": verdict.key_points,
+            "reasoning": verdict.reasoning,
+            "action_suggestions": verdict.action_suggestions,
+            "full_text": verdict.full_text,
+        }
+
+    # ========== 主入口：非流式（供 routes.py / POST /trial 使用）==========
 
     async def run_trial(
         self,
@@ -691,13 +933,37 @@ class CourtSimulator:
             )
             speeches.append(SpeechRecord(ROLE_DEFENDANT, d_speech, rn, self._now()))
 
-            # 法官追问
-            j_inquiry = await self._gen_judge_inquiry(
+            # 法官判断是否追问
+            decision = await self._gen_judge_decision(
                 case_description, opening, rn, trial_rounds, p_speech, d_speech,
             )
-            speeches.append(SpeechRecord(ROLE_JUDGE, j_inquiry, rn, self._now()))
+            j_inquiry = ""
+            p_answer = ""
+            d_answer = ""
+            user_answer = ""
 
-            trial_rounds.append(TrialRound(rn, p_speech, d_speech, j_inquiry))
+            if decision.should_ask and decision.question:
+                j_inquiry = decision.question
+                speeches.append(SpeechRecord(ROLE_JUDGE, j_inquiry, rn, self._now()))
+
+                target = decision.target
+                if target in ("plaintiff", "both"):
+                    p_answer = await self._gen_plaintiff_answer(
+                        case_description, opening, rn, trial_rounds,
+                        p_speech, d_speech, j_inquiry,
+                    )
+                    speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_answer, rn, self._now()))
+                if target in ("defendant", "both"):
+                    d_answer = await self._gen_defendant_answer(
+                        case_description, opening, rn, trial_rounds,
+                        p_speech, d_speech, j_inquiry,
+                    )
+                    speeches.append(SpeechRecord(ROLE_DEFENDANT, d_answer, rn, self._now()))
+                # 非交互模式：evidence_needed 时无法询问用户，仅记录
+
+            trial_rounds.append(TrialRound(
+                rn, p_speech, d_speech, j_inquiry, p_answer, d_answer,
+            ))
 
         # 3. 最终判决
         verdict = await self._gen_verdict(case_description, opening, trial_rounds)
@@ -722,94 +988,302 @@ class CourtSimulator:
             created_at=now,
         )
 
-    # ========== 主入口：流式 ==========
+    # ========== 主入口：交互式流式 ==========
 
-    async def stream_trial(
+    async def stream_trial_interactive(
         self,
         case_description: str,
         rounds: int = 2,
+        answer_callback: Optional[Callable[..., Any]] = None,
+        trial_id: Optional[str] = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
-        运行完整庭审（流式），yield 每个事件的 dict。
+        运行完整庭审（交互式流式）。
+
+        流程：
+        1. 审判长开场（流式 + reasoning）
+        2. 多轮辩论：
+           a. 原告陈述（流式 + reasoning）
+           b. 被告答辩（流式 + reasoning）
+           c. 法官追问决策（非流式 JSON）
+              - should_ask=false 时跳过追问，进入下一轮
+           d. 追问：法官提问 → 被问方必须回答（流式 + reasoning）
+           e. 证据检查：若回答含"不清楚/不知道"，触发 user_question
+              - 发送 user_question 事件，流暂停等待 answer_callback 返回
+              - 用户回答后继续辩论
+           f. round_end
+        3. 最终判决（非流式，提取 reasoning）
+           - 证据充分：明确胜负（禁止端水）
+           - 用户也说"不知道"：判"证据不足"+ 倾向性意见
 
         事件格式：
-            {"event": "speech_start", "role": "chief_judge", "round": 0}
-            {"event": "speech_chunk", "role": "chief_judge", "text": "...", "round": 0}
-            {"event": "speech_end", "role": "chief_judge", "round": 0}
-            ...
-            {"event": "done", "trial_id": "...", "result": {...}}
-            {"event": "error", "message": "..."}
+            {"type":"trial_started","trial_id":"..."}
+            {"type":"thinking","role":"plaintiff","text":"...","round":1}
+            {"type":"speech","role":"plaintiff","text":"...","kind":"statement","round":1}
+            {"type":"speech_end","role":"plaintiff","kind":"statement","round":1}
+            {"type":"user_question","question_id":"q1_p","question":"...","context":"...","round":1}
+            {"type":"user_answer","question_id":"q1_p","answer":"...","round":1}
+            {"type":"round_end","round":1}
+            {"type":"verdict","verdict":{...},"round":N}
+            {"type":"done","trial_id":"...","result":{...}}
+            {"type":"error","message":"..."}
         """
         rounds = max(1, min(rounds, 5))
-        trial_id = self._new_trial_id()
+        trial_id = trial_id or self._new_trial_id()
         now = self._now()
 
         speeches: list[SpeechRecord] = []
         trial_rounds: list[TrialRound] = []
+        user_said_unknown = False
 
         try:
-            # 1. 审判长开场
+            # 通知前端 trial_id
+            yield {"type": "trial_started", "trial_id": trial_id}
+
+            # 1. 审判长开场（流式 + reasoning）
             opening = ""
-            yield {"event": "speech_start", "role": ROLE_CHIEF_JUDGE, "round": 0}
-            async for chunk in self._stream_opening(case_description):
-                opening += chunk
-                yield {"event": "speech_chunk", "role": ROLE_CHIEF_JUDGE, "text": chunk, "round": 0}
-            yield {"event": "speech_end", "role": ROLE_CHIEF_JUDGE, "round": 0}
+            opening_msgs = [
+                {"role": "system", "content": SYSTEM_CHIEF_JUDGE},
+                {"role": "user", "content": self._opening_prompt(case_description)},
+            ]
+            async for ev in self._stream_role_speech(
+                opening_msgs, ROLE_CHIEF_JUDGE, KIND_OPENING, MODEL_SPEECH, 0,
+                temperature=0.5, max_tokens=1200,
+                fallback_text=self._fallback_opening(case_description),
+            ):
+                yield ev
+                if ev["type"] == "speech":
+                    opening += ev["text"]
             speeches.append(SpeechRecord(ROLE_CHIEF_JUDGE, opening, 0, now))
 
             # 2. 多轮辩论
             for rn in range(1, rounds + 1):
-                # 原告
                 p_speech = ""
-                yield {"event": "speech_start", "role": ROLE_PLAINTIFF, "round": rn}
-                async for chunk in self._stream_plaintiff(
-                    case_description, opening, rn, trial_rounds,
+                d_speech = ""
+                j_inquiry = ""
+                p_answer = ""
+                d_answer = ""
+                user_answer = ""
+
+                # a. 原告陈述（流式 + reasoning）
+                p_msgs = [
+                    {"role": "system", "content": SYSTEM_PLAINTIFF},
+                    {"role": "user", "content": self._plaintiff_prompt(
+                        case_description, opening, rn, trial_rounds,
+                    )},
+                ]
+                async for ev in self._stream_role_speech(
+                    p_msgs, ROLE_PLAINTIFF, KIND_STATEMENT, MODEL_SPEECH, rn,
+                    temperature=0.6, max_tokens=1000,
+                    fallback_text=self._fallback_speech("plaintiff", case_description, rn),
                 ):
-                    p_speech += chunk
-                    yield {"event": "speech_chunk", "role": ROLE_PLAINTIFF, "text": chunk, "round": rn}
-                yield {"event": "speech_end", "role": ROLE_PLAINTIFF, "round": rn}
+                    yield ev
+                    if ev["type"] == "speech":
+                        p_speech += ev["text"]
                 speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_speech, rn, self._now()))
 
-                # 被告
-                d_speech = ""
-                yield {"event": "speech_start", "role": ROLE_DEFENDANT, "round": rn}
-                async for chunk in self._stream_defendant(
-                    case_description, opening, rn, trial_rounds, p_speech,
+                # b. 被告答辩（流式 + reasoning）
+                d_msgs = [
+                    {"role": "system", "content": SYSTEM_DEFENDANT},
+                    {"role": "user", "content": self._defendant_prompt(
+                        case_description, opening, rn, trial_rounds, p_speech,
+                    )},
+                ]
+                async for ev in self._stream_role_speech(
+                    d_msgs, ROLE_DEFENDANT, KIND_STATEMENT, MODEL_SPEECH, rn,
+                    temperature=0.6, max_tokens=1000,
+                    fallback_text=self._fallback_speech("defendant", case_description, rn),
                 ):
-                    d_speech += chunk
-                    yield {"event": "speech_chunk", "role": ROLE_DEFENDANT, "text": chunk, "round": rn}
-                yield {"event": "speech_end", "role": ROLE_DEFENDANT, "round": rn}
+                    yield ev
+                    if ev["type"] == "speech":
+                        d_speech += ev["text"]
                 speeches.append(SpeechRecord(ROLE_DEFENDANT, d_speech, rn, self._now()))
 
-                # 法官追问
-                j_inquiry = ""
-                yield {"event": "speech_start", "role": ROLE_JUDGE, "round": rn}
-                async for chunk in self._stream_judge_inquiry(
+                # c. 法官追问决策（非流式 JSON）
+                yield {
+                    "type": "thinking",
+                    "role": ROLE_JUDGE,
+                    "text": f"法官正在审查第 {rn} 轮辩论，判断是否需要追问...",
+                    "round": rn,
+                }
+                decision = await self._gen_judge_decision(
                     case_description, opening, rn, trial_rounds, p_speech, d_speech,
-                ):
-                    j_inquiry += chunk
-                    yield {"event": "speech_chunk", "role": ROLE_JUDGE, "text": chunk, "round": rn}
-                yield {"event": "speech_end", "role": ROLE_JUDGE, "round": rn}
-                speeches.append(SpeechRecord(ROLE_JUDGE, j_inquiry, rn, self._now()))
+                )
 
-                trial_rounds.append(TrialRound(rn, p_speech, d_speech, j_inquiry))
+                if decision.should_ask and decision.question:
+                    j_inquiry = decision.question
+                    target = decision.target
+                    target_label = {
+                        "plaintiff": "原告", "defendant": "被告", "both": "原被告双方",
+                    }.get(target, "双方")
 
-            # 3. 最终判决（流式生成判决书文本）
-            verdict_text = ""
-            yield {"event": "speech_start", "role": ROLE_VERDICT, "round": rounds + 1}
-            async for chunk in self._stream_verdict_text(
-                case_description, opening, trial_rounds,
-            ):
-                verdict_text += chunk
-                yield {"event": "speech_chunk", "role": ROLE_VERDICT, "text": chunk, "round": rounds + 1}
-            yield {"event": "speech_end", "role": ROLE_VERDICT, "round": rounds + 1}
+                    # d. 法官追问（已由决策 LLM 生成，一次性发出）
+                    yield {
+                        "type": "speech",
+                        "role": ROLE_JUDGE,
+                        "text": j_inquiry,
+                        "kind": KIND_INQUIRY,
+                        "round": rn,
+                    }
+                    yield {
+                        "type": "speech_end",
+                        "role": ROLE_JUDGE,
+                        "kind": KIND_INQUIRY,
+                        "round": rn,
+                    }
+                    speeches.append(SpeechRecord(ROLE_JUDGE, j_inquiry, rn, self._now()))
 
-            # 解析判决 JSON
-            verdict = self._parse_verdict(verdict_text, case_description)
-            # 如果解析后 full_text 为空（JSON 无 verdict_text），用原始文本
-            if not verdict.full_text:
-                verdict.full_text = verdict_text
-            speeches.append(SpeechRecord(ROLE_VERDICT, verdict.full_text, rounds + 1, self._now()))
+                    # 原告回答法官
+                    if target in ("plaintiff", "both"):
+                        yield {
+                            "type": "thinking",
+                            "role": ROLE_PLAINTIFF,
+                            "text": f"原告正在针对法官追问（对象：{target_label}）组织回答...",
+                            "round": rn,
+                        }
+                        pa_msgs = [
+                            {"role": "system", "content": SYSTEM_PLAINTIFF},
+                            {"role": "user", "content": self._plaintiff_answer_prompt(
+                                case_description, opening, rn, trial_rounds,
+                                p_speech, d_speech, j_inquiry,
+                            )},
+                        ]
+                        async for ev in self._stream_role_speech(
+                            pa_msgs, ROLE_PLAINTIFF, KIND_ANSWER, MODEL_SPEECH, rn,
+                            temperature=0.5, max_tokens=700,
+                            fallback_text="（原告暂无回应）",
+                        ):
+                            yield ev
+                            if ev["type"] == "speech":
+                                p_answer += ev["text"]
+                        speeches.append(SpeechRecord(ROLE_PLAINTIFF, p_answer, rn, self._now()))
+
+                        # 证据检查：原告回答含"不清楚" → 向用户询问
+                        if self._needs_user_input(p_answer) and answer_callback is not None:
+                            question_id = f"q{rn}_plaintiff"
+                            ev_q, ev_ctx = self._build_user_question(
+                                "plaintiff", p_answer, j_inquiry, rn,
+                            )
+                            yield {
+                                "type": "user_question",
+                                "question_id": question_id,
+                                "question": ev_q,
+                                "context": ev_ctx,
+                                "round": rn,
+                            }
+                            try:
+                                u_ans = await answer_callback(question_id, ev_q, ev_ctx)
+                            except Exception as exc:
+                                u_ans = f"（用户回答失败：{exc}）"
+                            if not isinstance(u_ans, str):
+                                u_ans = str(u_ans)
+                            yield {
+                                "type": "user_answer",
+                                "question_id": question_id,
+                                "answer": u_ans,
+                                "round": rn,
+                            }
+                            if self._is_user_unknown(u_ans):
+                                user_said_unknown = True
+                            user_answer = u_ans
+
+                    # 被告回答法官
+                    if target in ("defendant", "both"):
+                        yield {
+                            "type": "thinking",
+                            "role": ROLE_DEFENDANT,
+                            "text": f"被告正在针对法官追问（对象：{target_label}）组织回答...",
+                            "round": rn,
+                        }
+                        da_msgs = [
+                            {"role": "system", "content": SYSTEM_DEFENDANT},
+                            {"role": "user", "content": self._defendant_answer_prompt(
+                                case_description, opening, rn, trial_rounds,
+                                p_speech, d_speech, j_inquiry,
+                            )},
+                        ]
+                        async for ev in self._stream_role_speech(
+                            da_msgs, ROLE_DEFENDANT, KIND_ANSWER, MODEL_SPEECH, rn,
+                            temperature=0.5, max_tokens=700,
+                            fallback_text="（被告暂无回应）",
+                        ):
+                            yield ev
+                            if ev["type"] == "speech":
+                                d_answer += ev["text"]
+                        speeches.append(SpeechRecord(ROLE_DEFENDANT, d_answer, rn, self._now()))
+
+                        # 证据检查：被告回答含"不清楚" → 向用户询问
+                        if self._needs_user_input(d_answer) and answer_callback is not None:
+                            question_id = f"q{rn}_defendant"
+                            ev_q, ev_ctx = self._build_user_question(
+                                "defendant", d_answer, j_inquiry, rn,
+                            )
+                            yield {
+                                "type": "user_question",
+                                "question_id": question_id,
+                                "question": ev_q,
+                                "context": ev_ctx,
+                                "round": rn,
+                            }
+                            try:
+                                d_u_ans = await answer_callback(question_id, ev_q, ev_ctx)
+                            except Exception as exc:
+                                d_u_ans = f"（用户回答失败：{exc}）"
+                            if not isinstance(d_u_ans, str):
+                                d_u_ans = str(d_u_ans)
+                            yield {
+                                "type": "user_answer",
+                                "question_id": question_id,
+                                "answer": d_u_ans,
+                                "round": rn,
+                            }
+                            if self._is_user_unknown(d_u_ans):
+                                user_said_unknown = True
+                            if user_answer:
+                                user_answer += f"\n（被告方追问）{d_u_ans}"
+                            else:
+                                user_answer = d_u_ans
+                else:
+                    # 法官决定不追问
+                    yield {
+                        "type": "thinking",
+                        "role": ROLE_JUDGE,
+                        "text": f"法官审查后认为第 {rn} 轮辩论无需追问，进入下一环节。",
+                        "round": rn,
+                    }
+
+                trial_rounds.append(TrialRound(
+                    rn, p_speech, d_speech, j_inquiry, p_answer, d_answer, user_answer,
+                ))
+                yield {"type": "round_end", "round": rn}
+
+            # 3. 最终判决（非流式，提取 reasoning）
+            yield {
+                "type": "thinking",
+                "role": ROLE_JUDGE,
+                "text": "法官正在综合所有辩论和证据，撰写判决书...",
+                "round": rounds + 1,
+            }
+            verdict, v_reasoning = await self._gen_verdict_structured(
+                case_description, opening, trial_rounds, user_said_unknown,
+            )
+            # 若判决模型有 reasoning_content，作为思考过程展示
+            if v_reasoning:
+                yield {
+                    "type": "thinking",
+                    "role": ROLE_JUDGE,
+                    "text": v_reasoning,
+                    "round": rounds + 1,
+                }
+            speeches.append(SpeechRecord(
+                ROLE_VERDICT, verdict.full_text, rounds + 1, self._now(),
+            ))
+
+            yield {
+                "type": "verdict",
+                "verdict": self._verdict_to_dict(verdict),
+                "round": rounds + 1,
+            }
 
             summary = (
                 f"庭审完成，共 {rounds} 轮辩论。"
@@ -829,10 +1303,10 @@ class CourtSimulator:
                 created_at=now,
             )
 
-            yield {"event": "done", "trial_id": trial_id, "result": result.to_dict()}
+            yield {"type": "done", "trial_id": trial_id, "result": result.to_dict()}
 
         except Exception as exc:
-            yield {"event": "error", "message": str(exc)}
+            yield {"type": "error", "message": str(exc)}
 
 
 # ========== 向后兼容：LegalMultiAgentDebate（供 routes.py 使用）==========
@@ -885,7 +1359,14 @@ class LegalMultiAgentDebate:
         for r in trial.rounds:
             steps.append(f"第 {r.round_number} 轮 - 原告陈述")
             steps.append(f"第 {r.round_number} 轮 - 被告答辩")
-            steps.append(f"第 {r.round_number} 轮 - 法官追问")
+            if r.judge_inquiry:
+                steps.append(f"第 {r.round_number} 轮 - 法官追问")
+            if r.plaintiff_answer:
+                steps.append(f"第 {r.round_number} 轮 - 原告回答法官")
+            if r.defendant_answer:
+                steps.append(f"第 {r.round_number} 轮 - 被告回答法官")
+            if r.user_answer:
+                steps.append(f"第 {r.round_number} 轮 - 用户补充证据")
         steps.append("法官：做出最终判决")
 
         return MultiAgentDebateResult(

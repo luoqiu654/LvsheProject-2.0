@@ -258,7 +258,10 @@ class LLMGateway:
         max_tokens: int = 1024,
     ):
         """
-        流式调用聊天模型，返回异步生成器，yield 每个 chunk 的文本。
+        流式调用聊天模型，返回异步生成器，yield 每个 chunk 的**正式回答**文本。
+
+        注意：只 yield content 字段（正式回答），不 yield reasoning_content（思考过程）。
+        若需同时获取思考过程，使用 chat_stream_with_reasoning()。
 
         用法：
             async for chunk in gateway.chat_stream(messages):
@@ -284,6 +287,59 @@ class LLMGateway:
                 text = self._extract_chunk_text(chunk)
                 if text:
                     yield text
+
+        except Exception as exc:
+            raise LLMGatewayError(
+                f"调用 LLM 流式失败，model={model_name}。"
+                f"错误信息：{exc}"
+            ) from exc
+
+    async def chat_stream_with_reasoning(
+        self,
+        messages: list[dict[str, str]],
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: int = 1024,
+    ):
+        """
+        流式调用聊天模型，返回异步生成器，yield (type, text) 元组。
+
+        - type="reasoning"：思考过程（GLM-4.7-Flash 等推理模型的 reasoning_content）
+        - type="content"：正式回答（content 字段）
+
+        用法：
+            async for typ, text in gateway.chat_stream_with_reasoning(messages):
+                if typ == "reasoning":
+                    # 展示在思考面板
+                    pass
+                else:
+                    # 展示为正式回答
+                    pass
+        """
+        from litellm import acompletion
+
+        config = self._build_config(model=model or provider, model_type="text")
+        model_name = config.model
+
+        try:
+            response = await acompletion(
+                model=f"openai/{model_name}",
+                messages=messages,
+                api_key=config.api_key,
+                api_base=config.api_base,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+
+            async for chunk in response:
+                reasoning = self._extract_chunk_reasoning(chunk)
+                if reasoning:
+                    yield ("reasoning", reasoning)
+                content = self._extract_chunk_text(chunk)
+                if content:
+                    yield ("content", content)
 
         except Exception as exc:
             raise LLMGatewayError(
@@ -317,51 +373,80 @@ class LLMGateway:
 
     def _extract_chunk_text(self, chunk: Any) -> str:
         """
-        从流式响应的 chunk 中提取文本。
+        从流式响应的 chunk 中提取**正式回答**文本（content 字段）。
 
-        兼容 GLM 推理模型：
-        - 优先返回 delta.content（常规文本）
-        - 若 content 为空，回退到 delta.reasoning_content（推理内容）
+        注意：GLM-4.7-Flash 等推理模型会先输出 reasoning_content（思考过程），
+        再输出 content（正式回答）。此方法只返回 content，不返回 reasoning_content。
+        思考过程通过 _extract_chunk_reasoning 单独提取。
         """
         try:
             if isinstance(chunk, dict):
                 choices = chunk.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {})
-                    text = delta.get("content") or delta.get("reasoning_content") or ""
-                    return text
+                    return delta.get("content") or ""
             else:
                 if hasattr(chunk, "choices") and chunk.choices:
                     delta = chunk.choices[0].delta
-                    # 优先 content，回退 reasoning_content（GLM-4.7-Flash 等推理模型）
-                    text = getattr(delta, "content", None) or getattr(delta, "reasoning_content", None) or ""
-                    return text
+                    return getattr(delta, "content", None) or ""
+            return ""
+        except Exception:
+            return ""
+
+    def _extract_chunk_reasoning(self, chunk: Any) -> str:
+        """
+        从流式响应的 chunk 中提取**思考过程**文本（reasoning_content 字段）。
+
+        仅 GLM-4.7-Flash 等推理模型会输出此字段。
+        普通模型（如 glm-4.6）无此字段，返回空字符串。
+        """
+        try:
+            if isinstance(chunk, dict):
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    return delta.get("reasoning_content") or ""
+            else:
+                if hasattr(chunk, "choices") and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    return getattr(delta, "reasoning_content", None) or ""
             return ""
         except Exception:
             return ""
 
     def extract_text(self, response: Any) -> str:
         """
-        从 LiteLLM / OpenAI 兼容响应中提取文本。
+        从 LiteLLM / OpenAI 兼容响应中提取**正式回答**文本（content 字段）。
 
-        兼容 GLM 推理模型：
-        - 优先返回 message.content
-        - 若 content 为空，回退到 message.reasoning_content
-
-        同时兼容：
-        - 对象形式 response.choices[0].message.content
-        - dict 形式 response["choices"][0]["message"]["content"]
+        注意：只返回 content，不返回 reasoning_content。
+        若需获取思考过程，使用 extract_reasoning()。
         """
         try:
             if isinstance(response, dict):
                 msg = response["choices"][0]["message"]
-                return msg.get("content") or msg.get("reasoning_content") or ""
+                return msg.get("content") or ""
 
             msg = response.choices[0].message
-            return getattr(msg, "content", None) or getattr(msg, "reasoning_content", None) or ""
+            return getattr(msg, "content", None) or ""
 
         except Exception as exc:
             raise LLMGatewayError(f"无法解析 LLM 响应文本：{exc}") from exc
+
+    def extract_reasoning(self, response: Any) -> str:
+        """
+        从 LLM 响应中提取**思考过程**文本（reasoning_content 字段）。
+
+        仅 GLM-4.7-Flash 等推理模型有此字段，普通模型返回空字符串。
+        """
+        try:
+            if isinstance(response, dict):
+                msg = response["choices"][0]["message"]
+                return msg.get("reasoning_content") or ""
+
+            msg = response.choices[0].message
+            return getattr(msg, "reasoning_content", None) or ""
+        except Exception:
+            return ""
 
     # ========== 视觉模型（GLM-OCR 文档分析）==========
 

@@ -1,14 +1,27 @@
-"""专家会诊子路由 — 法庭模拟。
+"""专家会诊子路由 — 法庭模拟（交互式 SSE）。
 
 端点：
-  POST /api/expert/trial          — 启动庭审（非流式），返回完整 TrialResult
-  POST /api/expert/trial/stream    — 启动庭审（SSE 流式），实时推送每个角色发言
-  GET  /api/expert/trials/{id}     — 获取历史庭审记录
-  GET  /api/expert/health          — 健康检查
+  POST /api/expert/trial/stream       — 启动庭审（SSE 流式交互），实时推送发言
+  POST /api/expert/trial/{id}/answer  — 用户提交对法官追问的回答，恢复暂停的流
+  GET  /api/expert/trial/{id}         — 获取历史庭审记录
+  POST /api/expert/trial              — 启动庭审（非流式），返回完整 TrialResult
+  GET  /api/expert/health             — 健康检查
+
+交互式流程：
+  1. 前端 POST /trial/stream，建立 SSE 连接
+  2. 后端先发 ``trial_started`` 事件（含 trial_id）
+  3. 流式推送每个角色发言（thinking/speech/speech_end）
+  4. 法官自主判断是否追问；被问方必须回答
+  5. 当回答含"不清楚/不知道"时，发 ``user_question`` 事件，流暂停
+  6. 前端弹模态窗，用户回答后 POST /trial/{id}/answer
+  7. 后端将答案推入 asyncio.Queue，庭审继续
+  8. 最终发 ``verdict`` 事件（结构化判决）和 ``done`` 事件
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -22,6 +35,10 @@ router = APIRouter(prefix="/api/expert", tags=["专家会诊"])
 
 # 庭审历史记录（内存存储，进程重启后丢失）
 _trial_store: dict[str, dict[str, Any]] = {}
+
+# 交互式庭审运行态：trial_id -> {"queue": asyncio.Queue, "status": str}
+# status: "running" / "waiting_answer" / "done"
+_trials: dict[str, dict[str, Any]] = {}
 
 
 # ========== 请求 / 响应模型 ==========
@@ -38,11 +55,35 @@ class TrialRequest(BaseModel):
     )
 
 
+class AnswerRequest(BaseModel):
+    """用户回答法官追问的请求体。"""
+
+    question_id: str = Field(..., description="问题 ID（与 user_question 事件一致）")
+    answer: str = Field(..., min_length=1, description="用户的回答")
+
+
 class TrialStatusResponse(BaseModel):
     """庭审状态。"""
 
     ok: bool
     llm_available: bool
+
+
+# ========== 内部工具 ==========
+
+
+def _new_trial_id() -> str:
+    return uuid.uuid4().hex[:16]
+
+
+def _get_trial(trial_id: str) -> dict[str, Any] | None:
+    return _trials.get(trial_id)
+
+
+def _set_trial_status(trial_id: str, status: str) -> None:
+    state = _trials.get(trial_id)
+    if state is not None:
+        state["status"] = status
 
 
 # ========== 端点 ==========
@@ -69,8 +110,7 @@ async def start_trial(request: TrialRequest) -> dict[str, Any]:
     - summary: 庭审总结
     - speeches: 所有发言记录
 
-    注意：庭审可能耗时较长（每轮 3 次 LLM 调用 + 1 次判决），
-    建议前端设置 5 分钟以上超时，或使用流式接口。
+    注意：庭审可能耗时较长，建议使用流式接口。
     """
     result = await court_simulator.run_trial(
         case_description=request.case_description,
@@ -84,26 +124,54 @@ async def start_trial(request: TrialRequest) -> dict[str, Any]:
 @router.post("/trial/stream")
 async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
     """
-    启动庭审（SSE 流式）。
+    启动庭审（SSE 流式交互）。
 
-    实时推送每个角色的发言片段，事件格式：
-      data: {"event":"speech_start","role":"chief_judge","round":0}\\n\\n
-      data: {"event":"speech_chunk","role":"chief_judge","text":"...","round":0}\\n\\n
-      data: {"event":"speech_end","role":"chief_judge","round":0}\\n\\n
-      ...
-      data: {"event":"done","trial_id":"...","result":{...}}\\n\\n
-      data: {"event":"error","message":"..."}\\n\\n
+    事件格式（data: {JSON}\\n\\n）：
+      {"type":"trial_started","trial_id":"..."}
+      {"type":"thinking","role":"plaintiff","text":"...","round":1}
+      {"type":"speech","role":"plaintiff","text":"...","kind":"statement","round":1}
+      {"type":"speech_end","role":"plaintiff","kind":"statement","round":1}
+      {"type":"user_question","question_id":"q1_p","question":"...","context":"...","round":1}
+      （流暂停，等待用户回答）
+      {"type":"user_answer","question_id":"q1_p","answer":"...","round":1}
+      {"type":"round_end","round":1}
+      {"type":"verdict","verdict":{...},"round":N}
+      {"type":"done","trial_id":"...","result":{...}}
+      {"type":"error","message":"..."}
     """
+    trial_id = _new_trial_id()
+    answer_queue: asyncio.Queue[str] = asyncio.Queue()
+    _trials[trial_id] = {"queue": answer_queue, "status": "running"}
+
+    async def answer_callback(
+        question_id: str, question: str, context: str,
+    ) -> str:
+        """当法官触发证据询问时调用，阻塞等待用户通过 /answer 端点提交。"""
+        _set_trial_status(trial_id, "waiting_answer")
+        try:
+            answer = await answer_queue.get()
+        finally:
+            _set_trial_status(trial_id, "running")
+        return answer
 
     async def generate():
         try:
-            async for event in court_simulator.stream_trial(
+            async for event in court_simulator.stream_trial_interactive(
                 case_description=request.case_description,
                 rounds=request.rounds,
+                answer_callback=answer_callback,
+                trial_id=trial_id,
             ):
+                # 持久化 done 事件的结果
+                if event.get("type") == "done":
+                    result = event.get("result")
+                    if isinstance(result, dict):
+                        _trial_store[trial_id] = result
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'event': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+        finally:
+            _set_trial_status(trial_id, "done")
 
     return StreamingResponse(
         generate(),
@@ -112,11 +180,47 @@ async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "X-Trial-Id": trial_id,
         },
     )
 
 
-@router.get("/trials/{trial_id}")
+@router.post("/trial/{trial_id}/answer")
+async def submit_trial_answer(
+    trial_id: str, request: AnswerRequest,
+) -> dict[str, Any]:
+    """
+    用户提交对法官追问的回答。
+
+    当 SSE 流发出 ``user_question`` 事件后，流会暂停等待用户回答。
+    前端收集用户回答后调用此端点，答案会被推入对应庭审的 asyncio.Queue，
+    被阻塞的庭审流程随即恢复。
+
+    请求体：
+      {"question_id": "q1_p", "answer": "是，我持有书面合同"}
+    """
+    state = _get_trial(trial_id)
+    if state is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"庭审不存在或已结束：{trial_id}",
+        )
+    if state["status"] != "waiting_answer":
+        raise HTTPException(
+            status_code=409,
+            detail=f"当前庭审未在等待回答（状态：{state['status']}）",
+        )
+    queue: asyncio.Queue[str] = state["queue"]
+    await queue.put(request.answer)
+    return {
+        "ok": True,
+        "trial_id": trial_id,
+        "question_id": request.question_id,
+        "status": "resumed",
+    }
+
+
+@router.get("/trial/{trial_id}")
 async def get_trial(trial_id: str) -> dict[str, Any]:
     """获取历史庭审记录。"""
     data = _trial_store.get(trial_id)

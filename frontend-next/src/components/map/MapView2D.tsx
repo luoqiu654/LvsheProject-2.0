@@ -7,18 +7,15 @@ import {
   type LocationCategory,
 } from '@/data/map-locations'
 
-// MapTiler 配置（Key 设计为前端可见，非私密 key）
-const MAPTILER_KEY = 'BRVGk2DhuQUmnSvnZIRU'
-const MAP_STYLE_URL = `https://api.maptiler.com/maps/hybrid/style.json?key=${MAPTILER_KEY}`
-const TERRAIN_TILES_URL = `https://api.maptiler.com/tiles/terrain-rgb/tiles.json?key=${MAPTILER_KEY}`
+// OpenFreeMap 平面模式样式（无需 API Key，完全免费开源）
+// positron：浅色简洁，类似 Apple Map 浅色风格，加载快速
+const MAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/positron'
 
 // 默认中心：上海
 const DEFAULT_CENTER: [number, number] = [121.4737, 31.2304]
-const DEFAULT_ZOOM = 12.5
-const DEFAULT_PITCH = 45
-const DEFAULT_BEARING = 0
+const DEFAULT_ZOOM = 12
 
-/** 分类图标字符（Apple Map 风格的圆形标记中显示） */
+/** 分类图标字符（与 MapView3D 保持一致） */
 const categoryIconChar: Record<LocationCategory, string> = {
   law_firm: '律',
   court: '法',
@@ -27,7 +24,7 @@ const categoryIconChar: Record<LocationCategory, string> = {
   other: '·',
 }
 
-// marker 与 popup 的样式（注入到 <head>，避免污染全局 CSS 文件）
+// marker 与 popup 的样式（与 MapView3D 共用同一套样式定义）
 const INJECTED_STYLE = `
 .lvsh-map-marker{
   display:flex;align-items:center;justify-content:center;
@@ -57,39 +54,45 @@ const INJECTED_STYLE = `
 .lvsh-popup__value{color:#374151;flex:1;word-break:break-word;}
 `
 
-interface MapView3DProps {
+/** 视图状态：经纬度中心 + 缩放 */
+export interface MapViewSnapshot {
+  center: [number, number]
+  zoom: number
+}
+
+interface MapView2DProps {
   locations: MapLocation[]
   selectedLocationId: string | null
   onSelectLocation: (id: string | null) => void
   /** 当 nonce 变化时，飞行到 id 对应地点 */
   flyTarget: { id: string; nonce: number } | null
   /** 初始视图（用于模式切换时保持中心/缩放），仅首次初始化生效 */
-  initialView?: { center: [number, number]; zoom: number }
+  initialView?: MapViewSnapshot
   /** 地图移动结束时回调，用于上报当前视图状态 */
-  onViewChange?: (view: { center: [number, number]; zoom: number }) => void
+  onViewChange?: (view: MapViewSnapshot) => void
 }
 
 /**
- * 3D 地图组件 - Apple Map 风格
- * 使用 maplibre-gl 原生 API + MapTiler hybrid 样式 + 3D 地形 + 3D 建筑
+ * 平面地图组件 - OpenFreeMap positron 样式
+ * 纯 2D，不启用 terrain / 3D 建筑，加载快速
  */
-export default function MapView3D({
+export default function MapView2D({
   locations,
   selectedLocationId,
   onSelectLocation,
   flyTarget,
   initialView,
   onViewChange,
-}: MapView3DProps) {
+}: MapView2DProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<maplibregl.Map | null>(null)
-  // 用一个稳定的回调引用避免重建 marker
+  // 用稳定的回调引用避免重建 marker / 重复绑定
   const onSelectRef = useRef(onSelectLocation)
   onSelectRef.current = onSelectLocation
   const onViewChangeRef = useRef(onViewChange)
   onViewChangeRef.current = onViewChange
   // 仅在首次初始化时读取 initialView，避免后续变更导致重建
-  const initialViewRef = useRef(initialView)
+  const initialViewRef = useRef<MapViewSnapshot | undefined>(initialView)
 
   // 初始化地图（仅一次）
   useEffect(() => {
@@ -104,19 +107,24 @@ export default function MapView3D({
       style: MAP_STYLE_URL,
       center,
       zoom,
-      pitch: DEFAULT_PITCH,
-      bearing: DEFAULT_BEARING,
+      // 平面模式：禁止倾斜与旋转，保持纯 2D 视角
+      pitch: 0,
+      bearing: 0,
+      maxPitch: 0,
+      dragRotate: false,
+      touchPitch: false,
       attributionControl: { compact: true },
       canvasContextAttributes: { antialias: true },
     })
 
     mapRef.current = map
 
+    // 缩放按钮（不显示指南针，平面模式无需旋转）
     map.addControl(
       new maplibregl.NavigationControl({
-        visualizePitch: true,
+        visualizePitch: false,
         showZoom: true,
-        showCompass: true,
+        showCompass: false,
       }),
       'top-right',
     )
@@ -132,58 +140,6 @@ export default function MapView3D({
     }
     map.on('moveend', reportView)
     map.once('load', reportView)
-
-    map.on('style.load', () => {
-      // 1) 添加 3D 地形 DEM 源并启用
-      try {
-        if (!map.getSource('terrainSource')) {
-          map.addSource('terrainSource', {
-            type: 'raster-dem',
-            url: TERRAIN_TILES_URL,
-            tileSize: 512,
-          })
-        }
-        map.setTerrain({ source: 'terrainSource', exaggeration: 1.5 })
-      } catch (err) {
-        // 静默：地形加载失败不影响地图主体
-        console.warn('[MapView3D] terrain load failed:', err)
-      }
-
-      // 2) 添加 3D 建筑图层（zoom>=14 显示）
-      try {
-        const layers = map.getStyle()?.layers ?? []
-        const labelLayer = layers.find(
-          (l) =>
-            l.type === 'symbol' &&
-            (l.layout as { [k: string]: unknown } | undefined)?.[
-              'text-field'
-            ] !== undefined,
-        )
-
-        if (!map.getLayer('3d-buildings')) {
-          map.addLayer(
-            {
-              id: '3d-buildings',
-              source: 'composite',
-              'source-layer': 'building',
-              filter: ['==', 'extrude', 'true'],
-              type: 'fill-extrusion',
-              minzoom: 14,
-              paint: {
-                'fill-extrusion-color': '#d4d4d8',
-                'fill-extrusion-height': ['get', 'height'],
-                'fill-extrusion-base': ['get', 'min_height'],
-                'fill-extrusion-opacity': 0.7,
-              },
-            },
-            labelLayer ? labelLayer.id : undefined,
-          )
-        }
-      } catch (err) {
-        // MapTiler hybrid 样式自带 3D 建筑，自定义图层加载失败可忽略
-        console.info('[MapView3D] custom 3d-buildings layer skipped:', err)
-      }
-    })
 
     return () => {
       map.remove()
@@ -276,8 +232,9 @@ export default function MapView3D({
       map.flyTo({
         center: [target.lng, target.lat],
         zoom: Math.max(map.getZoom(), 15.5),
-        pitch: 60,
-        bearing: map.getBearing(),
+        // 平面模式：保持 2D 视角
+        pitch: 0,
+        bearing: 0,
         speed: 1.2,
         curve: 1.6,
         essential: true,
@@ -301,7 +258,7 @@ export default function MapView3D({
   )
 }
 
-/** 生成 popup HTML（地点详情卡片） */
+/** 生成 popup HTML（地点详情卡片，与 MapView3D 保持一致） */
 function renderPopupHtml(loc: MapLocation): string {
   const cfg = categoryConfig[loc.category]
   const phoneHtml = loc.phone

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 import json
+import re
 import tempfile
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -449,59 +451,151 @@ async def chat_stream(request: ChatRequest):
     )
 
 
+# 图片生成意图关键词（用于模型编排：语言模型编排图片生成模型）
+_IMAGE_GEN_KEYWORDS = [
+    "生成图片", "画一张", "生成一张", "画图", "绘制",
+    "画个", "生成一张图", "画一幅",
+]
+
+# 图片附件标记的正则模式
+# 匹配前端发送的标记：[附件图片: name]\n图片数据：data:image/...;base64,...\n[/附件图片]
+_IMAGE_ATTACH_PATTERN = re.compile(
+    r'\[附件图片:\s*([^\]]+)\]\n图片数据：(data:image/[^;]+;base64,[^\n]+)\n\[/附件图片\]'
+)
+
+
+def _is_image_gen_request(text: str) -> bool:
+    """检测用户是否要求生成图片（触发 GLM-Image 图片生成模型编排）。"""
+    return any(k in text for k in _IMAGE_GEN_KEYWORDS)
+
+
 @router.post("/chat/multi-turn")
 async def chat_multi_turn(request: MultiTurnChatRequest):
     """
     多轮对话流式接口，返回 SSE 格式。
 
-    请求体接受完整的对话历史 messages，后端直接透传给 LLM，
-    支持真正的多轮上下文。
+    请求体接受完整的对话历史 messages，后端进行模型编排：
+
+    模型编排逻辑：
+    1. 检测图片生成关键词 → 调用 GLM-Image 图片生成模型
+    2. 检测图片附件标记 → 调用 GLM-OCR 视觉模型分析，结果注入 LLM 消息
+    3. 正常流程 → chat_stream_with_reasoning 流式生成（含 reasoning_content 思考过程）
 
     事件格式：
-        data: {"text": "片段"}\n\n
-        data: {"done": true}\n\n   (结束)
-        data: {"error": "..."}\n\n  (出错)
+        data: {"thinking": "..."}\n\n  (思考过程，前端折叠展示)
+        data: {"text": "片段"}\n\n      (正式回答)
+        data: {"image": "/api/image/download?filename=...&user_id=..."}\n\n  (生成的图片URL)
+        data: {"done": true}\n\n        (结束)
+        data: {"error": "..."}\n\n       (出错)
     """
-    # 组装消息列表
     raw_messages = [{"role": m.role, "content": m.content} for m in request.messages]
-
-    # 如果开启 RAG，用最后一条用户消息检索法律知识并注入系统提示
-    if request.use_rag:
-        last_user_msg = next(
-            (m.content for m in reversed(request.messages) if m.role == "user"),
-            "",
-        )
-        if last_user_msg:
-            try:
-                contexts = rag.search(last_user_msg, top_k=4)
-                if contexts:
-                    context_text = "\n\n---\n\n".join(
-                        c.get("content", "")[:800] for c in contexts if c.get("content")
-                    )
-                    rag_system = (
-                        "你是严谨、专业、友好的中文法律 AI 助手。"
-                        "以下是与用户问题相关的法律知识片段，请在回答时参考：\n\n"
-                        f"{context_text}\n\n"
-                        "请基于以上知识和你的专业判断回答用户问题。"
-                    )
-                    # 如果首条不是 system，则插入；否则替换
-                    if raw_messages and raw_messages[0]["role"] == "system":
-                        raw_messages[0]["content"] = rag_system
-                    else:
-                        raw_messages.insert(0, {"role": "system", "content": rag_system})
-            except Exception:
-                # RAG 检索失败不阻断对话
-                pass
+    last_user_msg = next(
+        (m.content for m in reversed(request.messages) if m.role == "user"),
+        "",
+    )
 
     async def generate():
         try:
-            async for chunk in gateway.chat_stream(
+            # ===== 模型编排 1：图片生成（语言模型编排 GLM-Image）=====
+            if _is_image_gen_request(last_user_msg):
+                yield f"data: {json.dumps({'thinking': '分析用户需求：生成图片'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'thinking': '调用 GLM-Image 生成图片...'}, ensure_ascii=False)}\n\n"
+                try:
+                    image_paths = await gateway.generate_image(
+                        prompt=last_user_msg,
+                        user_id="default",
+                    )
+                    for path in image_paths:
+                        filename = Path(path).name
+                        image_url = (
+                            f"/api/image/download?filename={quote(filename)}&user_id=default"
+                        )
+                        yield f"data: {json.dumps({'image': image_url}, ensure_ascii=False)}\n\n"
+                    count = len(image_paths)
+                    if count > 0:
+                        yield f"data: {json.dumps({'text': f'已使用 **GLM-Image** 为您生成 {count} 张图片：'}, ensure_ascii=False)}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'text': '⚠️ 图片生成未返回结果'}, ensure_ascii=False)}\n\n"
+                except Exception as exc:
+                    yield f"data: {json.dumps({'text': f'⚠️ 图片生成失败：{exc}'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
+                return
+
+            # ===== 模型编排 2：视觉分析（语言模型编排 GLM-OCR）=====
+            yield f"data: {json.dumps({'thinking': '分析用户输入...'}, ensure_ascii=False)}\n\n"
+
+            # 检测用户消息中的图片附件标记，调用视觉模型分析并注入结果
+            for i, msg in enumerate(raw_messages):
+                if msg["role"] != "user":
+                    continue
+                content = msg["content"]
+                matches = list(_IMAGE_ATTACH_PATTERN.finditer(content))
+                if not matches:
+                    continue
+                yield f"data: {json.dumps({'thinking': f'调用视觉模型分析图片（{len(matches)} 张）...'}, ensure_ascii=False)}\n\n"
+                # 逆序替换以保持索引有效
+                for m in reversed(matches):
+                    name = m.group(1).strip()
+                    data_url = m.group(2)
+                    try:
+                        vision_result = await gateway.chat_with_vision(
+                            image=data_url,
+                            prompt="请详细描述这张图片的内容，特别关注其中可能涉及的法律相关信息，如合同、证件、票据、现场照片等。",
+                        )
+                        replacement = (
+                            f"[附件图片: {name}]\n视觉分析结果：{vision_result}\n[/附件图片]"
+                        )
+                    except Exception as exc:
+                        replacement = (
+                            f"[附件图片: {name}]\n视觉分析结果：（视觉分析失败：{exc}）\n[/附件图片]"
+                        )
+                    content = content[:m.start()] + replacement + content[m.end():]
+                raw_messages[i]["content"] = content
+                yield f"data: {json.dumps({'thinking': '视觉分析完成'}, ensure_ascii=False)}\n\n"
+
+            # ===== RAG 知识库增强 =====
+            if request.use_rag:
+                yield f"data: {json.dumps({'thinking': '正在检索法律知识库...'}, ensure_ascii=False)}\n\n"
+                contexts_count = 0
+                if last_user_msg:
+                    try:
+                        contexts = rag.search(last_user_msg, top_k=4)
+                        contexts_count = len(contexts) if contexts else 0
+                        if contexts:
+                            context_text = "\n\n---\n\n".join(
+                                c.get("content", "")[:800] for c in contexts if c.get("content")
+                            )
+                            rag_system = (
+                                "你是严谨、专业、友好的中文法律 AI 助手。"
+                                "以下是与用户问题相关的法律知识片段，请在回答时参考：\n\n"
+                                f"{context_text}\n\n"
+                                "请基于以上知识和你的专业判断回答用户问题。"
+                            )
+                            # 如果首条不是 system，则插入；否则替换
+                            if raw_messages and raw_messages[0]["role"] == "system":
+                                raw_messages[0]["content"] = rag_system
+                            else:
+                                raw_messages.insert(0, {"role": "system", "content": rag_system})
+                    except Exception:
+                        # RAG 检索失败不阻断对话
+                        pass
+                yield f"data: {json.dumps({'thinking': f'找到 {contexts_count} 条相关法律条文'}, ensure_ascii=False)}\n\n"
+
+            # ===== 正常流程：流式生成回复（含思考过程）=====
+            yield f"data: {json.dumps({'thinking': '生成回复...'}, ensure_ascii=False)}\n\n"
+
+            # 使用 chat_stream_with_reasoning 同时发送思考和正式回答
+            # GLM-4.7-Flash 会先输出 reasoning_content（思考过程），再输出 content（正式回答）
+            async for typ, text in gateway.chat_stream_with_reasoning(
                 messages=raw_messages,
                 model=request.model,
                 temperature=request.temperature,
                 max_tokens=request.max_tokens,
             ):
-                yield f"data: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+                if typ == "reasoning":
+                    yield f"data: {json.dumps({'thinking': text}, ensure_ascii=False)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
 
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
 

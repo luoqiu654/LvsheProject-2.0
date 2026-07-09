@@ -35,10 +35,10 @@ interface StageMeta {
 
 const STAGE_META: Record<string, StageMeta> = {
   parse: { label: "文档解析", icon: FileText },
-  vision: { label: "视觉识别", icon: Eye },
-  diagnose: { label: "风险诊断", icon: AlertTriangle },
+  vision: { label: "视觉识别 (GLM-OCR)", icon: Eye },
+  diagnose: { label: "风险诊断 (GLM-4.6)", icon: AlertTriangle },
   annotate: { label: "生成批注", icon: CheckCircle2 },
-  image: { label: "生成摘要图", icon: ImageIcon },
+  image: { label: "生成摘要图 (GLM-Image)", icon: ImageIcon },
 }
 
 const STAGE_ORDER = ["parse", "vision", "diagnose", "annotate", "image"]
@@ -84,6 +84,8 @@ export default function Contract() {
   const [showPreview, setShowPreview] = useState(false)
   const [history, setHistory] = useState<ReviewRecord[]>([])
   const [showHistory, setShowHistory] = useState(false)
+  // 风险摘要图放大查看（点击缩略图打开）
+  const [enlargedImage, setEnlargedImage] = useState<string | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -394,6 +396,33 @@ export default function Contract() {
         <div className="lg:col-span-1">
           {result ? (
             <div className="space-y-4">
+              {/* 风险摘要图（GLM-Image 生成，直接预览缩略图，点击放大） */}
+              {hasSummaryImage && (
+                <div className="rounded-xl border border-purple-200 bg-purple-50/40 p-4">
+                  <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-purple-700">
+                    <ImageIcon className="h-3.5 w-3.5" />
+                    风险摘要图（GLM-Image 生成）
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setEnlargedImage(summaryImageUrl(reviewId, userId))
+                    }
+                    className="group block w-full overflow-hidden rounded-lg border border-purple-200 bg-white transition hover:opacity-90"
+                    title="点击放大查看"
+                  >
+                    <img
+                      src={summaryImageUrl(reviewId, userId)}
+                      alt="风险摘要图"
+                      className="max-h-56 w-full object-contain"
+                    />
+                  </button>
+                  <p className="mt-1.5 text-[11px] text-purple-400">
+                    点击图片可放大查看
+                  </p>
+                </div>
+              )}
+
               {/* 风险统计 */}
               <div className="rounded-xl border border-gray-200 bg-white p-5">
                 <h3 className="mb-3 text-sm font-semibold text-gray-900">
@@ -453,7 +482,7 @@ export default function Contract() {
                       className="flex w-full items-center gap-2 rounded-lg bg-purple-50 px-3 py-2 text-sm font-medium text-purple-700 transition hover:bg-purple-100"
                     >
                       <ImageIcon className="h-4 w-4" />
-                      查看风险摘要图
+                      在新标签打开摘要图
                     </a>
                   )}
                 </div>
@@ -537,6 +566,29 @@ export default function Contract() {
           result={result}
           onClose={() => setShowPreview(false)}
         />
+      )}
+
+      {/* 风险摘要图放大查看（点击缩略图触发） */}
+      {enlargedImage && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setEnlargedImage(null)}
+        >
+          <button
+            type="button"
+            onClick={() => setEnlargedImage(null)}
+            className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-white transition hover:bg-white/20"
+            title="关闭"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <img
+            src={enlargedImage}
+            alt="风险摘要图（大图）"
+            className="max-h-[90vh] max-w-[90vw] rounded-lg object-contain shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
       )}
     </div>
   )

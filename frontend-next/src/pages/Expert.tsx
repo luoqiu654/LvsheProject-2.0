@@ -1,7 +1,27 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import { Play, Square, RotateCcw, Download, AlertCircle, Loader2, Scale, Gavel } from "lucide-react"
-import { streamTrial, type TrialResult, type TrialRole } from "@/api/expert"
+import {
+  Play,
+  Square,
+  RotateCcw,
+  Download,
+  AlertCircle,
+  Loader2,
+  Scale,
+  Gavel,
+  MessageCircleQuestion,
+  Send,
+} from "lucide-react"
+import {
+  streamTrial,
+  submitAnswer,
+  type TrialResult,
+  type TrialRole,
+  type SpeechKind,
+  type UserQuestion,
+  type TrialVerdict,
+} from "@/api/expert"
 import { MarkdownRenderer } from "@/components/shared/MarkdownRenderer"
+import { ThinkingPanel } from "@/components/shared/ThinkingPanel"
 import { cn } from "@/lib/utils"
 
 // ========== 角色信息 ==========
@@ -58,6 +78,17 @@ const ROLE_INFO: Record<TrialRole, RoleInfo> = {
   },
 }
 
+// ========== 发言种类标签 ==========
+
+const KIND_LABEL: Record<SpeechKind, string> = {
+  opening: "开场白",
+  statement: "陈述",
+  inquiry: "法官追问",
+  answer: "回答法官",
+  verdict: "判决书",
+  user: "用户补充",
+}
+
 // ========== 发言卡片类型 ==========
 
 interface SpeechCard {
@@ -66,6 +97,7 @@ interface SpeechCard {
   round: number
   content: string
   isComplete: boolean
+  kind: SpeechKind
 }
 
 // ========== 示例案件 ==========
@@ -86,7 +118,22 @@ export default function Expert() {
   const [isRunning, setIsRunning] = useState(false)
   const [speeches, setSpeeches] = useState<SpeechCard[]>([])
   const [trialResult, setTrialResult] = useState<TrialResult | null>(null)
+  const [verdict, setVerdict] = useState<TrialVerdict | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // 交互式庭审状态
+  const [trialId, setTrialId] = useState<string | null>(null)
+  const [pendingQuestion, setPendingQuestion] = useState<UserQuestion | null>(
+    null,
+  )
+  const [answerInput, setAnswerInput] = useState("")
+  const [submittingAnswer, setSubmittingAnswer] = useState(false)
+  // 思考过程（按角色累积 reasoning_content 文本）
+  const [thinkingContent, setThinkingContent] = useState<
+    Record<string, string>
+  >({})
+  const [currentlyThinking, setCurrentlyThinking] = useState<TrialRole | null>(
+    null,
+  )
   const abortRef = useRef<AbortController | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
 
@@ -102,6 +149,31 @@ export default function Expert() {
     scrollToBottom()
   }, [speeches, scrollToBottom])
 
+  // 查找当前角色+轮次+种类的未完成发言卡片（用于追加流式文本）
+  const findCurrentSpeech = useCallback(
+    (
+      list: SpeechCard[],
+      role: TrialRole,
+      round: number,
+      kind: SpeechKind,
+    ): SpeechCard | undefined => {
+      // 从末尾向前查找：最后一个匹配且未完成的卡片
+      for (let i = list.length - 1; i >= 0; i--) {
+        const s = list[i]
+        if (
+          s.role === role &&
+          s.round === round &&
+          s.kind === kind &&
+          !s.isComplete
+        ) {
+          return s
+        }
+      }
+      return undefined
+    },
+    [],
+  )
+
   // 开始庭审
   const handleStart = useCallback(async () => {
     const text = caseInput.trim()
@@ -109,8 +181,14 @@ export default function Expert() {
 
     setSpeeches([])
     setTrialResult(null)
+    setVerdict(null)
     setError(null)
     setIsRunning(true)
+    setTrialId(null)
+    setPendingQuestion(null)
+    setAnswerInput("")
+    setThinkingContent({})
+    setCurrentlyThinking(null)
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -119,65 +197,120 @@ export default function Expert() {
       { case_description: text, rounds },
       {
         signal: controller.signal,
-        onEvent: (event) => {
-          if (event.event === "speech_start" && event.role !== undefined) {
-            setSpeeches((prev) => [
+        onTrialStarted: (id) => setTrialId(id),
+        onThinking: (role, thinkText, _round) => {
+          setCurrentlyThinking(role)
+          setThinkingContent((prev) => ({
+            ...prev,
+            [role]: (prev[role] || "") + thinkText,
+          }))
+        },
+        onSpeech: (role, speechText, kind, round) => {
+          // 角色开始发言，思考阶段结束（不清空已积累的思考内容）
+          setCurrentlyThinking((prev) => (prev === role ? null : prev))
+          setSpeeches((prev) => {
+            const existing = findCurrentSpeech(prev, role, round, kind)
+            if (existing) {
+              // 追加到现有卡片
+              return prev.map((s) =>
+                s.id === existing.id
+                  ? { ...s, content: s.content + speechText }
+                  : s,
+              )
+            }
+            // 创建新卡片
+            return [
               ...prev,
               {
                 id: crypto.randomUUID(),
-                role: event.role!,
-                round: event.round ?? 0,
-                content: "",
+                role,
+                round,
+                content: speechText,
                 isComplete: false,
+                kind,
               },
-            ])
-          } else if (event.event === "speech_chunk" && event.text && event.role !== undefined) {
-            const role = event.role!
-            const round = event.round ?? 0
-            setSpeeches((prev) =>
-              prev.map((s) =>
-                s.role === role && s.round === round && !s.isComplete
-                  ? { ...s, content: s.content + event.text }
-                  : s,
-              ),
-            )
-          } else if (event.event === "speech_end" && event.role !== undefined) {
-            const role = event.role!
-            const round = event.round ?? 0
-            setSpeeches((prev) =>
-              prev.map((s) =>
-                s.role === role && s.round === round && !s.isComplete
-                  ? { ...s, isComplete: true }
-                  : s,
-              ),
-            )
-          } else if (event.event === "done") {
-            if (event.result) {
-              setTrialResult(event.result)
+            ]
+          })
+        },
+        onSpeechEnd: (role, kind, round) => {
+          setSpeeches((prev) => {
+            const existing = findCurrentSpeech(prev, role, round, kind)
+            if (existing) {
+              return prev.map((s) =>
+                s.id === existing.id ? { ...s, isComplete: true } : s,
+              )
             }
-          } else if (event.event === "error") {
-            setError(event.message || "庭审出错")
+            return prev
+          })
+        },
+        onUserQuestion: (q) => {
+          setPendingQuestion(q)
+          setAnswerInput("")
+        },
+        onUserAnswer: (_questionId, answer, round) => {
+          // 用户回答作为审判长席位的"用户补充"卡片显示
+          setSpeeches((prev) => [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "chief_judge" as TrialRole,
+              round,
+              content: answer,
+              isComplete: true,
+              kind: "user" as SpeechKind,
+            },
+          ])
+        },
+        onRoundEnd: () => {
+          setCurrentlyThinking(null)
+        },
+        onVerdict: (v, _round) => {
+          setVerdict(v)
+          setCurrentlyThinking(null)
+        },
+        onDone: (result) => {
+          setCurrentlyThinking(null)
+          if (result) {
+            setTrialResult(result)
+            if (result.verdict) {
+              setVerdict(result.verdict)
+            }
           }
         },
         onError: (err) => {
+          setCurrentlyThinking(null)
           setError(err)
-        },
-        onDone: () => {
-          setIsRunning(false)
-          abortRef.current = null
         },
       },
     )
 
     setIsRunning(false)
     abortRef.current = null
-  }, [caseInput, isRunning, rounds])
+  }, [caseInput, isRunning, rounds, findCurrentSpeech])
+
+  // 提交用户对法官追问的回答
+  const handleSubmitAnswer = useCallback(async () => {
+    if (!trialId || !pendingQuestion) return
+    const answer = answerInput.trim()
+    if (!answer) return
+    setSubmittingAnswer(true)
+    try {
+      await submitAnswer(trialId, pendingQuestion.question_id, answer)
+      setPendingQuestion(null)
+      setAnswerInput("")
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "提交回答失败")
+    } finally {
+      setSubmittingAnswer(false)
+    }
+  }, [trialId, pendingQuestion, answerInput])
 
   // 停止庭审
   const handleStop = useCallback(() => {
     abortRef.current?.abort()
     abortRef.current = null
     setIsRunning(false)
+    setCurrentlyThinking(null)
     // 标记当前未完成的发言为已完成
     setSpeeches((prev) => prev.map((s) => ({ ...s, isComplete: true })))
   }, [])
@@ -187,76 +320,103 @@ export default function Expert() {
     if (isRunning) handleStop()
     setSpeeches([])
     setTrialResult(null)
+    setVerdict(null)
     setError(null)
     setCaseInput("")
+    setTrialId(null)
+    setPendingQuestion(null)
+    setAnswerInput("")
+    setThinkingContent({})
+    setCurrentlyThinking(null)
   }, [isRunning, handleStop])
 
   // 导出庭审记录
   const handleExport = useCallback(() => {
     const result = trialResult
-    if (!result) return
+    const v = verdict
+    if (!result && !v) return
 
     const lines: string[] = []
     lines.push("# 法庭模拟庭审记录")
     lines.push("")
-    lines.push(`**庭审ID**: ${result.trial_id}`)
-    lines.push(`**创建时间**: ${result.created_at}`)
-    lines.push(`**案件**: ${result.case}`)
-    lines.push(`**总结**: ${result.summary}`)
-    lines.push("")
-    lines.push("---")
-    lines.push("")
-    lines.push("## 审判长开场白")
-    lines.push("")
-    lines.push(result.opening)
-    lines.push("")
-
-    for (const r of result.rounds) {
+    if (result) {
+      lines.push(`**庭审ID**: ${result.trial_id}`)
+      lines.push(`**创建时间**: ${result.created_at}`)
+      lines.push(`**案件**: ${result.case}`)
+      lines.push(`**总结**: ${result.summary}`)
+      lines.push("")
       lines.push("---")
       lines.push("")
-      lines.push(`## 第 ${r.round_number} 轮辩论`)
+      lines.push("## 审判长开场白")
       lines.push("")
-      lines.push("### 原告")
+      lines.push(result.opening)
       lines.push("")
-      lines.push(r.plaintiff_speech)
-      lines.push("")
-      lines.push("### 被告")
-      lines.push("")
-      lines.push(r.defendant_speech)
-      lines.push("")
-      if (r.judge_inquiry) {
-        lines.push("### 法官追问")
+
+      for (const r of result.rounds) {
+        lines.push("---")
         lines.push("")
-        lines.push(r.judge_inquiry)
+        lines.push(`## 第 ${r.round_number} 轮辩论`)
         lines.push("")
+        lines.push("### 原告")
+        lines.push("")
+        lines.push(r.plaintiff_speech)
+        lines.push("")
+        lines.push("### 被告")
+        lines.push("")
+        lines.push(r.defendant_speech)
+        lines.push("")
+        if (r.judge_inquiry) {
+          lines.push("### 法官追问")
+          lines.push("")
+          lines.push(r.judge_inquiry)
+          lines.push("")
+        }
+        if (r.plaintiff_answer) {
+          lines.push("### 原告回答法官")
+          lines.push("")
+          lines.push(r.plaintiff_answer)
+          lines.push("")
+        }
+        if (r.defendant_answer) {
+          lines.push("### 被告回答法官")
+          lines.push("")
+          lines.push(r.defendant_answer)
+          lines.push("")
+        }
+        if (r.user_answer) {
+          lines.push("### 用户（当事人）补充证据")
+          lines.push("")
+          lines.push(r.user_answer)
+          lines.push("")
+        }
       }
     }
 
-    if (result.verdict) {
+    if (v) {
       lines.push("---")
       lines.push("")
       lines.push("## 最终判决")
       lines.push("")
-      lines.push(`**胜诉方**: ${result.verdict.winner}`)
-      lines.push(`**原告胜诉概率**: ${result.verdict.plaintiff_win_rate}%`)
-      lines.push(`**被告胜诉概率**: ${result.verdict.defendant_win_rate}%`)
+      lines.push(`**胜诉方**: ${v.winner}`)
+      lines.push(`**原告胜诉概率**: ${v.plaintiff_win_rate.toFixed(0)}%`)
+      lines.push(`**被告胜诉概率**: ${v.defendant_win_rate.toFixed(0)}%`)
       lines.push("")
       lines.push("### 关键胜负点")
-      for (const p of result.verdict.key_points) {
+      for (const p of v.key_points) {
         lines.push(`- ${p}`)
       }
       lines.push("")
       lines.push("### 判决理由")
-      lines.push(result.verdict.reasoning)
+      lines.push(v.reasoning)
       lines.push("")
       lines.push("### 行动建议")
-      for (const s of result.verdict.action_suggestions) {
+      for (const s of v.action_suggestions) {
         lines.push(`- ${s}`)
       }
       lines.push("")
       lines.push("### 判决书全文")
       lines.push("")
-      lines.push(result.verdict.full_text)
+      lines.push(v.full_text)
     }
 
     const md = lines.join("\n")
@@ -264,19 +424,22 @@ export default function Expert() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement("a")
     a.href = url
-    a.download = `庭审记录_${result.trial_id}.md`
+    a.download = `庭审记录_${result?.trial_id ?? "trial"}.md`
     a.click()
     URL.revokeObjectURL(url)
-  }, [trialResult])
+  }, [trialResult, verdict])
 
   // 按角色分组发言
   const chiefJudgeSpeeches = speeches.filter((s) => s.role === "chief_judge")
   const plaintiffSpeeches = speeches.filter((s) => s.role === "plaintiff")
   const defendantSpeeches = speeches.filter((s) => s.role === "defendant")
-  const judgeSpeeches = speeches.filter((s) => s.role === "judge" || s.role === "verdict")
+  const judgeSpeeches = speeches.filter(
+    (s) => s.role === "judge" || s.role === "verdict",
+  )
 
   const hasStarted = speeches.length > 0 || isRunning
-  const canStart = caseInput.trim().length >= MIN_CASE_LENGTH && !isRunning
+  const canStart =
+    caseInput.trim().length >= MIN_CASE_LENGTH && !isRunning
 
   return (
     <div className="flex h-full flex-col overflow-hidden bg-gray-50">
@@ -285,7 +448,9 @@ export default function Expert() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Gavel className="h-5 w-5 text-purple-600" />
-            <h1 className="text-lg font-bold text-gray-900">专家会诊 · 法庭模拟</h1>
+            <h1 className="text-lg font-bold text-gray-900">
+              专家会诊 · 法庭模拟
+            </h1>
           </div>
           <div className="flex items-center gap-2">
             {/* 辩论轮数选择 */}
@@ -325,7 +490,7 @@ export default function Expert() {
               </button>
             )}
             {/* 导出按钮 */}
-            {trialResult && !isRunning && (
+            {(verdict || trialResult) && !isRunning && (
               <button
                 onClick={handleExport}
                 className="flex items-center gap-1.5 rounded-lg bg-green-100 px-4 py-1.5 text-sm font-medium text-green-700 transition hover:bg-green-200"
@@ -385,7 +550,9 @@ export default function Expert() {
 
               {/* 示例案件 */}
               <div className="mt-6">
-                <p className="mb-2 text-xs font-medium text-gray-500">或试试这些案例：</p>
+                <p className="mb-2 text-xs font-medium text-gray-500">
+                  或试试这些案例：
+                </p>
                 <div className="grid gap-2">
                   {EXAMPLES.map((ex, i) => (
                     <button
@@ -412,6 +579,8 @@ export default function Expert() {
               areaClass="border-purple-200 bg-purple-50/60"
               headerClass="text-purple-800"
               speeches={chiefJudgeSpeeches}
+              thinkingContent={thinkingContent["chief_judge"] || ""}
+              isThinking={currentlyThinking === "chief_judge"}
             />
 
             {/* 原告席 | 被告席（中部两列） */}
@@ -422,6 +591,8 @@ export default function Expert() {
                 areaClass="border-blue-200 bg-blue-50/60"
                 headerClass="text-blue-800"
                 speeches={plaintiffSpeeches}
+                thinkingContent={thinkingContent["plaintiff"] || ""}
+                isThinking={currentlyThinking === "plaintiff"}
               />
               <CourtArea
                 title="被告席"
@@ -429,6 +600,8 @@ export default function Expert() {
                 areaClass="border-red-200 bg-red-50/60"
                 headerClass="text-red-800"
                 speeches={defendantSpeeches}
+                thinkingContent={thinkingContent["defendant"] || ""}
+                isThinking={currentlyThinking === "defendant"}
               />
             </div>
 
@@ -439,21 +612,40 @@ export default function Expert() {
               areaClass="border-green-200 bg-green-50/60"
               headerClass="text-green-800"
               speeches={judgeSpeeches.filter((s) => s.role === "judge")}
+              thinkingContent={thinkingContent["judge"] || ""}
+              isThinking={currentlyThinking === "judge"}
             />
 
             {/* 判决书 */}
-            {trialResult?.verdict && !isRunning && (
-              <VerdictPanel result={trialResult} />
-            )}
+            {verdict && !isRunning && <VerdictPanel verdict={verdict} />}
 
             {/* 运行中提示 */}
-            {isRunning && (
+            {isRunning && !pendingQuestion && (
               <div className="flex items-center justify-center gap-2 py-4 text-sm text-gray-500">
                 <Loader2 className="h-4 w-4 animate-spin" />
                 庭审进行中...
               </div>
             )}
+
+            {/* 等待用户回答提示 */}
+            {isRunning && pendingQuestion && (
+              <div className="flex items-center justify-center gap-2 py-4 text-sm text-amber-600">
+                <MessageCircleQuestion className="h-4 w-4" />
+                等待您回答法官的追问...
+              </div>
+            )}
           </div>
+        )}
+
+        {/* 用户回答法官追问的模态窗口 */}
+        {pendingQuestion && (
+          <UserQuestionModal
+            question={pendingQuestion}
+            answer={answerInput}
+            onAnswerChange={setAnswerInput}
+            onSubmit={handleSubmitAnswer}
+            submitting={submittingAnswer}
+          />
         )}
       </div>
     </div>
@@ -468,6 +660,8 @@ interface CourtAreaProps {
   areaClass: string
   headerClass: string
   speeches: SpeechCard[]
+  thinkingContent: string
+  isThinking: boolean
 }
 
 function CourtArea({
@@ -476,6 +670,8 @@ function CourtArea({
   areaClass,
   headerClass,
   speeches,
+  thinkingContent,
+  isThinking,
 }: CourtAreaProps) {
   return (
     <div className={cn("rounded-xl border p-4", areaClass)}>
@@ -488,8 +684,16 @@ function CourtArea({
           </span>
         )}
       </div>
+      {/* 思考过程折叠面板（使用 content prop 展示流式 reasoning_content） */}
+      {(thinkingContent || isThinking) && (
+        <ThinkingPanel
+          content={thinkingContent}
+          isThinking={isThinking}
+          className="mb-3"
+        />
+      )}
       <div className="space-y-3">
-        {speeches.length === 0 ? (
+        {speeches.length === 0 && !isThinking ? (
           <div className="py-4 text-center text-xs text-gray-400">
             等待发言...
           </div>
@@ -511,24 +715,47 @@ interface SpeechBubbleProps {
 
 function SpeechBubble({ speech }: SpeechBubbleProps) {
   const info = ROLE_INFO[speech.role]
-  const roundLabel = speech.round === 0
-    ? "开场"
-    : speech.role === "verdict"
-      ? "最终判决"
-      : `第 ${speech.round} 轮`
+  const kindLabel = KIND_LABEL[speech.kind] || ""
+  const roundLabel =
+    speech.round === 0
+      ? "开场"
+      : speech.role === "verdict"
+        ? "最终判决"
+        : `第 ${speech.round} 轮`
+
+  // 用户补充证据的特殊样式
+  const isUserAnswer = speech.kind === "user"
 
   return (
     <div className={cn("rounded-lg border bg-white p-3 shadow-sm", info.card)}>
       {/* 头部 */}
       <div className="mb-2 flex items-center justify-between">
-        <span className={cn("rounded px-2 py-0.5 text-xs font-medium", info.badge)}>
+        <span
+          className={cn(
+            "rounded px-2 py-0.5 text-xs font-medium",
+            info.badge,
+          )}
+        >
           {info.emoji} {info.label}
+          {kindLabel && kindLabel !== "陈述" && (
+            <span className="ml-1 opacity-70">· {kindLabel}</span>
+          )}
         </span>
         <span className="text-xs text-gray-400">{roundLabel}</span>
       </div>
       {/* 内容 */}
       <div className="text-sm leading-relaxed text-gray-800">
-        {speech.content ? (
+        {isUserAnswer ? (
+          // 用户回答用特殊样式突出
+          <div className="rounded-md border border-amber-200 bg-amber-50/70 px-3 py-2">
+            <span className="mb-1 block text-xs font-medium text-amber-700">
+              您的回答：
+            </span>
+            <div className="whitespace-pre-wrap break-words">
+              {speech.content}
+            </div>
+          </div>
+        ) : speech.content ? (
           <>
             {speech.role === "verdict" ? (
               <MarkdownRenderer
@@ -561,13 +788,10 @@ function SpeechBubble({ speech }: SpeechBubbleProps) {
 // ========== 子组件：判决面板 ==========
 
 interface VerdictPanelProps {
-  result: TrialResult
+  verdict: TrialVerdict
 }
 
-function VerdictPanel({ result }: VerdictPanelProps) {
-  const verdict = result.verdict
-  if (!verdict) return null
-
+function VerdictPanel({ verdict }: VerdictPanelProps) {
   const winnerColor =
     verdict.winner === "原告"
       ? "bg-blue-100 text-blue-700 border-blue-300"
@@ -585,7 +809,12 @@ function VerdictPanel({ result }: VerdictPanelProps) {
       {/* 胜诉方 */}
       <div className="mb-4 flex items-center gap-3">
         <span className="text-sm text-gray-600">判决结果：</span>
-        <span className={cn("rounded-full border px-3 py-1 text-sm font-bold", winnerColor)}>
+        <span
+          className={cn(
+            "rounded-full border px-3 py-1 text-sm font-bold",
+            winnerColor,
+          )}
+        >
           {verdict.winner}
         </span>
       </div>
@@ -611,10 +840,15 @@ function VerdictPanel({ result }: VerdictPanelProps) {
       {/* 关键胜负点 */}
       {verdict.key_points.length > 0 && (
         <div className="mb-4">
-          <h3 className="mb-2 text-sm font-semibold text-gray-700">关键胜负点</h3>
+          <h3 className="mb-2 text-sm font-semibold text-gray-700">
+            关键胜负点
+          </h3>
           <ul className="space-y-1">
             {verdict.key_points.map((point, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-gray-600">
+              <li
+                key={i}
+                className="flex items-start gap-2 text-sm text-gray-600"
+              >
                 <span className="mt-1 text-amber-500">•</span>
                 {point}
               </li>
@@ -636,10 +870,15 @@ function VerdictPanel({ result }: VerdictPanelProps) {
       {/* 行动建议 */}
       {verdict.action_suggestions.length > 0 && (
         <div className="mb-4">
-          <h3 className="mb-2 text-sm font-semibold text-gray-700">行动建议</h3>
+          <h3 className="mb-2 text-sm font-semibold text-gray-700">
+            行动建议
+          </h3>
           <ul className="space-y-1">
             {verdict.action_suggestions.map((s, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-gray-600">
+              <li
+                key={i}
+                className="flex items-start gap-2 text-sm text-gray-600"
+              >
                 <span className="mt-1 text-green-500">✓</span>
                 {s}
               </li>
@@ -651,7 +890,9 @@ function VerdictPanel({ result }: VerdictPanelProps) {
       {/* 判决书全文 */}
       {verdict.full_text && (
         <div>
-          <h3 className="mb-2 text-sm font-semibold text-gray-700">判决书全文</h3>
+          <h3 className="mb-2 text-sm font-semibold text-gray-700">
+            判决书全文
+          </h3>
           <div className="rounded-lg bg-white/80 p-4">
             <MarkdownRenderer
               content={verdict.full_text}
@@ -664,6 +905,126 @@ function VerdictPanel({ result }: VerdictPanelProps) {
       {/* 风险提示 */}
       <div className="mt-4 border-t border-amber-200 pt-3 text-xs text-gray-500">
         ⚠️ 以上分析仅基于 AI 模拟，不构成正式法律意见。复杂案件或正式诉讼前，建议咨询专业律师。
+      </div>
+    </div>
+  )
+}
+
+// ========== 子组件：用户回答法官追问的模态窗 ==========
+
+interface UserQuestionModalProps {
+  question: UserQuestion
+  answer: string
+  onAnswerChange: (v: string) => void
+  onSubmit: () => void
+  submitting: boolean
+}
+
+function UserQuestionModal({
+  question,
+  answer,
+  onAnswerChange,
+  onSubmit,
+  submitting,
+}: UserQuestionModalProps) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="w-full max-w-lg rounded-2xl border-2 border-amber-300 bg-white p-6 shadow-2xl">
+        {/* 头部 */}
+        <div className="mb-4 flex items-center gap-2">
+          <MessageCircleQuestion className="h-5 w-5 text-amber-600" />
+          <h3 className="text-base font-bold text-amber-900">
+            法官需要您确认证据
+          </h3>
+        </div>
+
+        {/* 问题 */}
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/70 p-3">
+          <p className="mb-1 text-xs font-medium text-amber-700">
+            法官的问题
+          </p>
+          <p className="text-sm leading-relaxed text-gray-800">
+            {question.question}
+          </p>
+        </div>
+
+        {/* 上下文 */}
+        {question.context && (
+          <div className="mb-4 rounded-lg bg-gray-50 p-3">
+            <p className="mb-1 text-xs font-medium text-gray-500">
+              为什么问这个问题
+            </p>
+            <p className="text-xs leading-relaxed text-gray-600">
+              {question.context}
+            </p>
+          </div>
+        )}
+
+        {/* 回答输入 */}
+        <div className="mb-4">
+          <label className="mb-1.5 block text-xs font-medium text-gray-600">
+            您的回答
+          </label>
+          <textarea
+            value={answer}
+            onChange={(e) => onAnswerChange(e.target.value)}
+            placeholder="请回答是/否，或详细说明您持有的证据情况..."
+            rows={3}
+            autoFocus
+            className="w-full resize-y rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-800 placeholder-gray-400 focus:border-amber-500 focus:bg-white focus:outline-none"
+            onKeyDown={(e) => {
+              if (
+                e.key === "Enter" &&
+                (e.ctrlKey || e.metaKey) &&
+                !submitting
+              ) {
+                onSubmit()
+              }
+            }}
+          />
+          <p className="mt-1 text-xs text-gray-400">
+            提示：Ctrl/⌘ + Enter 快速提交
+          </p>
+        </div>
+
+        {/* 快捷回答按钮 */}
+        <div className="mb-4 flex gap-2">
+          {["是", "否", "我需要补充说明"].map((preset) => (
+            <button
+              key={preset}
+              type="button"
+              onClick={() => onAnswerChange(preset)}
+              className="rounded-md border border-gray-200 bg-gray-50 px-3 py-1 text-xs text-gray-600 transition hover:border-amber-300 hover:bg-amber-50"
+            >
+              {preset}
+            </button>
+          ))}
+        </div>
+
+        {/* 提交按钮 */}
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={!answer.trim() || submitting}
+          className={cn(
+            "flex w-full items-center justify-center gap-1.5 rounded-lg px-4 py-2.5 text-sm font-medium text-white transition",
+            !answer.trim() || submitting
+              ? "cursor-not-allowed bg-gray-300"
+              : "bg-amber-600 hover:bg-amber-700",
+          )}
+        >
+          {submitting ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              提交中...
+            </>
+          ) : (
+            <>
+              <Send className="h-4 w-4" />
+              提交回答
+            </>
+          )}
+        </button>
       </div>
     </div>
   )

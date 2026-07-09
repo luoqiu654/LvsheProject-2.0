@@ -18,6 +18,7 @@ import { analyzeImage, parseDocument } from "@/api/files"
 import type { Attachment } from "@/types/chat"
 import type { Message } from "@/types/chat"
 import { MarkdownRenderer } from "@/components/shared/MarkdownRenderer"
+import { ThinkingPanel } from "@/components/shared/ThinkingPanel"
 import { cn } from "@/lib/utils"
 
 // 允许上传的文件类型
@@ -82,6 +83,18 @@ export default function Chat() {
   const [pendingAttachments, setPendingAttachments] = useState<
     PendingAttachment[]
   >([])
+  // 附件 ID -> 视觉分析描述（用于在用户消息下展示"AI视觉分析"卡片）
+  const [visionAnalysis, setVisionAnalysis] = useState<Record<string, string>>(
+    {},
+  )
+  // AI 消息 ID -> 思考步骤列表（折叠展示）
+  const [thinkingByMsg, setThinkingByMsg] = useState<Record<string, string[]>>(
+    {},
+  )
+  // AI 消息 ID -> 生成的图片 URL 列表（GLM-Image 生成结果）
+  const [generatedImages, setGeneratedImages] = useState<
+    Record<string, string[]>
+  >({})
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -154,15 +167,22 @@ export default function Chat() {
             reader.onerror = () => reject(new Error("图片读取失败"))
             reader.readAsDataURL(file)
           })
-          updatePending(id, { status: "ready", content: dataUrl })
-          // 调用后端视觉模型获取图片描述（失败则跳过，发送时附带降级说明）
+          // 保持 loading 状态直到视觉分析完成，避免发送时尚无分析结果
+          updatePending(id, { status: "loading", content: dataUrl })
+          // 调用后端 GLM-OCR 视觉模型分析图片内容
           try {
             const result = await analyzeImage(dataUrl)
-            if (result?.description) {
-              updatePending(id, { visionDescription: result.description })
+            const desc = result?.description || ""
+            updatePending(id, {
+              status: "ready",
+              visionDescription: desc,
+            })
+            if (desc) {
+              setVisionAnalysis((prev) => ({ ...prev, [id]: desc }))
             }
           } catch {
-            // 视觉接口不可用时忽略，发送时仍会附带图片说明
+            // 视觉接口不可用时仍允许发送（无分析卡片）
+            updatePending(id, { status: "ready" })
           }
         } else {
           // doc: 调后端解析
@@ -243,14 +263,13 @@ export default function Chat() {
     if (isStreaming) return
 
     // 构建注入后端的内容：在文本前附上文件摘要
+    // 图片附件发送 data URL，后端通过 /api/chat/multi-turn 编排视觉模型分析
     const fileContextParts: string[] = []
     for (const att of readyAttachments) {
       if (att.kind === "image") {
-        const desc =
-          att.visionDescription ||
-          "（图片已上传，但视觉分析不可用，请基于图片名称推断内容）"
+        // 发送图片 data URL，后端将调用 GLM-OCR 视觉模型分析并注入结果
         fileContextParts.push(
-          `[附件图片: ${att.name}]\n视觉分析结果：${desc}\n[/附件图片]`,
+          `[附件图片: ${att.name}]\n图片数据：${att.content}\n[/附件图片]`,
         )
       } else {
         fileContextParts.push(
@@ -324,9 +343,14 @@ export default function Chat() {
     }
     addMessage(convId, aiMsg)
 
-    // 流式请求
     const controller = new AbortController()
     abortRef.current = controller
+
+    // ===== 统一流式回复分支 =====
+    // 后端 /api/chat/multi-turn 负责编排：
+    //   1. 检测图片生成关键词 → 调用 GLM-Image
+    //   2. 检测图片附件 → 调用 GLM-OCR 视觉模型
+    //   3. 正常多轮对话 → chat_stream_with_reasoning
     let accumulated = ""
 
     await streamMultiTurn(apiMessages, {
@@ -334,6 +358,21 @@ export default function Chat() {
       use_rag: useRag,
       max_tokens: 4096,
       signal: controller.signal,
+      onThinking: (t) => {
+        setThinkingByMsg((prev) => {
+          const arr = prev[aiMsgId] || []
+          // 避免重复追加相同步骤
+          if (arr[arr.length - 1] === t) return prev
+          return { ...prev, [aiMsgId]: [...arr, t] }
+        })
+      },
+      onImage: (url) => {
+        // 后端 GLM-Image 生成的图片 URL
+        setGeneratedImages((prev) => ({
+          ...prev,
+          [aiMsgId]: [...(prev[aiMsgId] || []), url],
+        }))
+      },
       onChunk: (chunk) => {
         accumulated += chunk
         updateMessage(convId!, aiMsgId, accumulated)
@@ -362,6 +401,8 @@ export default function Chat() {
     updateMessage,
     setStreaming,
     setPendingAttachments,
+    setThinkingByMsg,
+    setGeneratedImages,
     renameConversation,
   ])
 
@@ -523,9 +564,45 @@ export default function Chat() {
                         <div className="inline-block whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-blue-600 px-4 py-2.5 text-sm text-white">
                           {msg.content}
                         </div>
+                        {/* AI 视觉分析卡片（GLM-OCR 分析结果，可折叠） */}
+                        {(() => {
+                          const steps = (msg.attachments || [])
+                            .filter(
+                              (att) =>
+                                att.type === "image" && visionAnalysis[att.id],
+                            )
+                            .map(
+                              (att) =>
+                                `📎 ${att.name}：\n${visionAnalysis[att.id]}`,
+                            )
+                          if (steps.length === 0) return null
+                          return (
+                            <div className="w-full max-w-md">
+                              <ThinkingPanel
+                                variant="vision"
+                                title="AI视觉分析（GLM-OCR）"
+                                steps={steps}
+                                defaultExpanded
+                              />
+                            </div>
+                          )
+                        })()}
                       </div>
                     ) : (
                       <div className="rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-sm ring-1 ring-gray-100">
+                        {/* 思考过程折叠面板 */}
+                        {thinkingByMsg[msg.id]?.length > 0 && (
+                          <ThinkingPanel
+                            steps={thinkingByMsg[msg.id]}
+                            active={
+                              isStreaming &&
+                              msg.id ===
+                                currentConversation.messages[
+                                  currentConversation.messages.length - 1
+                                ]?.id
+                            }
+                          />
+                        )}
                         {msg.content ? (
                           <MarkdownRenderer
                             content={msg.content}
@@ -537,6 +614,26 @@ export default function Chat() {
                             <span className="h-2 w-2 animate-bounce rounded-full bg-gray-300 [animation-delay:150ms]" />
                             <span className="h-2 w-2 animate-bounce rounded-full bg-gray-300 [animation-delay:300ms]" />
                           </span>
+                        )}
+                        {/* GLM-Image 生成的图片 */}
+                        {generatedImages[msg.id]?.length > 0 && (
+                          <div className="mt-3 flex flex-wrap gap-3">
+                            {generatedImages[msg.id].map((url, i) => (
+                              <a
+                                key={i}
+                                href={url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="点击查看大图"
+                              >
+                                <img
+                                  src={url}
+                                  alt={`生成图片 ${i + 1}`}
+                                  className="max-w-[16rem] rounded-lg border border-gray-200 object-contain shadow-sm transition hover:opacity-90"
+                                />
+                              </a>
+                            ))}
+                          </div>
                         )}
                         {/* 流式光标 */}
                         {isStreaming &&
