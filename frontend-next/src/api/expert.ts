@@ -10,45 +10,42 @@ export type TrialRole =
   | "judge"         // 中立法官（追问/决策）
   | "verdict"       // 判决
 
-/** 单次发言记录 */
+/** 单条发言记录（done 事件 result.speeches 项，与后端 _build_result 一致） */
 export interface TrialSpeech {
   role: TrialRole
+  kind: string
+  text: string
+  round: number
+}
+
+/** 用户回答记录（done 事件 result.user_answers 项） */
+export interface TrialUserAnswer {
+  question_id: string
+  question: string
+  answer: string
   content: string
-  round_number: number
-  timestamp: string
+  round: number
 }
 
-/** 单轮辩论记录 */
-export interface TrialRound {
-  round_number: number
-  plaintiff_speech: string
-  defendant_speech: string
-  judge_inquiry: string
-  plaintiff_answer: string
-  defendant_answer: string
-  user_answer: string
-}
-
-/** 法官判决（结构化） */
+/** 法官判决（结构化，与后端 court_orchestrator._verdict_to_dict 一致） */
 export interface TrialVerdict {
-  winner: string                       // 原告 / 被告 / 部分支持 / 无法判断
-  plaintiff_win_rate: number
-  defendant_win_rate: number
-  key_points: string[]
-  reasoning: string
-  action_suggestions: string[]
-  full_text: string                    // 完整判决书
+  winner: string                       // "原告胜诉" / "被告胜诉" / "部分支持" / "无法判断"
+  reasoning: string                    // 判决理由（非"LLM 服务不可用"误导文案）
+  full_text: string                    // 完整判决书文本
+  compensation: string                 // 赔偿/责任承担说明（可能为空）
 }
 
-/** 庭审完整结果 */
+/** 庭审完整结果（done 事件的 result，与后端 court_orchestrator._build_result 一致） */
 export interface TrialResult {
   trial_id: string
   case: string
-  opening: string
-  rounds: TrialRound[]
-  verdict: TrialVerdict | null
-  summary: string
+  rounds: number                       // 辩论轮数
   speeches: TrialSpeech[]
+  evidence_items: EvidenceItem[]
+  user_answers: TrialUserAnswer[]
+  user_said_unknown: boolean
+  verdict: TrialVerdict | null
+  retry_count: number                  // 判决打回重试次数
   created_at: string
 }
 
