@@ -27,6 +27,15 @@ import {
   type LucideIcon,
 } from "lucide-react"
 import { getSystemStatus, type SystemStatus } from "@/api/system"
+import {
+  motion,
+  useMotionValue,
+  useSpring,
+  useTransform,
+  AnimatePresence,
+} from "framer-motion"
+import Particles, { ParticlesProvider } from "@tsparticles/react"
+import { loadSlim } from "@tsparticles/slim"
 
 // 核心功能模块
 interface FeatureCard {
@@ -159,34 +168,44 @@ const stats: Stat[] = [
   { value: 4, suffix: "步", label: "快速上手" },
 ]
 
-// Hero 浮动粒子（模块级常量，避免重渲染重算）
-const particles = Array.from({ length: 20 }, (_, i) => ({
-  id: i,
-  left: Math.random() * 100,
-  top: 40 + Math.random() * 60,
-  size: 2 + Math.random() * 4,
-  delay: Math.random() * 8,
-  duration: 7 + Math.random() * 8,
-  variant: i % 2 === 0 ? "a" : "b",
-}))
+// tsparticles 配置：70 个蓝色/青色粒子 + 连线效果
+const LS_PARTICLES_OPTIONS = {
+  fpsLimit: 60,
+  fullScreen: { enable: false },
+  background: { color: { value: "transparent" } },
+  particles: {
+    number: { value: 70 },
+    color: { value: ["#7dd3fc", "#38bdf8", "#22d3ee", "#67e8f9"] },
+    links: {
+      enable: true,
+      color: "#7dd3fc",
+      distance: 140,
+      opacity: 0.35,
+      width: 1,
+    },
+    move: {
+      enable: true,
+      speed: 0.8,
+      direction: "none" as const,
+      random: true,
+      straight: false,
+      outModes: { default: "out" as const },
+    },
+    opacity: {
+      value: { min: 0.3, max: 0.9 },
+    },
+    size: {
+      value: { min: 1, max: 3 },
+    },
+  },
+  detectRetina: true,
+}
 
 // 动画 keyframes（注入到 <style>）
 const LS_ANIMATIONS = `
 @keyframes ls-aurora {
   0%, 100% { background-position: 0% 50%; }
   50% { background-position: 100% 50%; }
-}
-@keyframes ls-particle-a {
-  0% { transform: translate(0, 0) scale(1); opacity: 0; }
-  15% { opacity: 0.9; }
-  85% { opacity: 0.9; }
-  100% { transform: translate(22px, -90px) scale(0.4); opacity: 0; }
-}
-@keyframes ls-particle-b {
-  0% { transform: translate(0, 0) scale(1); opacity: 0; }
-  15% { opacity: 0.9; }
-  85% { opacity: 0.9; }
-  100% { transform: translate(-24px, -80px) scale(0.5); opacity: 0; }
 }
 @keyframes ls-fade-up {
   0% { transform: translateY(20px); opacity: 0; }
@@ -288,7 +307,7 @@ function Reveal({
   )
 }
 
-// 3D 倾斜卡片：鼠标移动时 perspective 旋转
+// 3D 倾斜卡片：framer-motion 鼠标位置驱动 rotateX/rotateY + 悬停上浮
 function TiltCard({
   children,
   className = "",
@@ -297,34 +316,40 @@ function TiltCard({
   className?: string
 }) {
   const ref = useRef<HTMLDivElement>(null)
+  const mouseX = useMotionValue(0.5)
+  const mouseY = useMotionValue(0.5)
+  const rotateX = useSpring(useTransform(mouseY, [0, 1], [8, -8]), {
+    stiffness: 300,
+    damping: 20,
+  })
+  const rotateY = useSpring(useTransform(mouseX, [0, 1], [-8, 8]), {
+    stiffness: 300,
+    damping: 20,
+  })
+
   const handleMove = (e: ReactMouseEvent<HTMLDivElement>) => {
     const el = ref.current
     if (!el) return
     const rect = el.getBoundingClientRect()
-    const px = (e.clientX - rect.left) / rect.width
-    const py = (e.clientY - rect.top) / rect.height
-    const rotateX = (0.5 - py) * 8
-    const rotateY = (px - 0.5) * 8
-    el.style.transform = `perspective(1000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) translateZ(0)`
+    mouseX.set((e.clientX - rect.left) / rect.width)
+    mouseY.set((e.clientY - rect.top) / rect.height)
   }
-  const reset = () => {
-    const el = ref.current
-    if (el) el.style.transform = "perspective(1000px) rotateX(0deg) rotateY(0deg)"
+  const handleLeave = () => {
+    mouseX.set(0.5)
+    mouseY.set(0.5)
   }
   return (
-    <div
+    <motion.div
       ref={ref}
       className={className}
       onMouseMove={handleMove}
-      onMouseLeave={reset}
-      style={{
-        transform: "perspective(1000px) rotateX(0deg) rotateY(0deg)",
-        transition: "transform 0.25s ease",
-        willChange: "transform",
-      }}
+      onMouseLeave={handleLeave}
+      style={{ rotateX, rotateY, transformPerspective: 1000 }}
+      whileHover={{ y: -6 }}
+      transition={{ type: "spring", stiffness: 300, damping: 20 }}
     >
       {children}
-    </div>
+    </motion.div>
   )
 }
 
@@ -340,6 +365,63 @@ function StatItem({ value, suffix, label }: Stat) {
       </div>
       <div className="mt-1 text-xs text-slate-500 md:text-sm">{label}</div>
     </div>
+  )
+}
+
+// 首次进入全屏开场动画：Logo 放大 + 淡出（sessionStorage 记录避免重复播放）
+function IntroOverlay() {
+  const [show, setShow] = useState(() => {
+    try {
+      return sessionStorage.getItem("ls_intro_played") !== "1"
+    } catch {
+      return false
+    }
+  })
+
+  useEffect(() => {
+    if (!show) return
+    const timer = setTimeout(() => {
+      setShow(false)
+      try {
+        sessionStorage.setItem("ls_intro_played", "1")
+      } catch {
+        // 忽略 sessionStorage 异常
+      }
+    }, 2400)
+    return () => clearTimeout(timer)
+  }, [show])
+
+  return (
+    <AnimatePresence>
+      {show && (
+        <motion.div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950"
+          initial={{ opacity: 1 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.7, ease: "easeInOut" }}
+        >
+          <motion.div
+            initial={{ scale: 0.5, opacity: 0 }}
+            animate={{ scale: [0.5, 1.1, 1], opacity: [0, 1, 1] }}
+            transition={{ duration: 1.5, times: [0, 0.6, 1], ease: "easeOut" }}
+            className="text-center"
+          >
+            <div className="bg-gradient-to-r from-blue-300 via-cyan-200 to-emerald-200 bg-clip-text text-5xl font-bold tracking-tight text-transparent md:text-8xl">
+              LvsheProject
+            </div>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: 0.8, duration: 0.6 }}
+              className="mt-3 text-sm font-medium tracking-widest text-slate-400"
+            >
+              法律 AI Agent 系统
+            </motion.div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   )
 }
 
@@ -374,6 +456,7 @@ export default function Home() {
   return (
     <div className="min-h-full bg-slate-50">
       <style dangerouslySetInnerHTML={{ __html: LS_ANIMATIONS }} />
+      <IntroOverlay />
 
       {/* Hero 区域 */}
       <section className="relative overflow-hidden">
@@ -396,28 +479,14 @@ export default function Home() {
             backgroundSize: "48px 48px",
           }}
         />
-        {/* 浮动粒子层 */}
+        {/* 粒子层（tsparticles：蓝色/青色粒子 + 连线） */}
         <div
           className="pointer-events-none absolute inset-0"
           style={{ transform: "translateZ(0)" }}
         >
-          {particles.map((p) => (
-            <span
-              key={p.id}
-              className="absolute rounded-full"
-              style={{
-                left: `${p.left}%`,
-                top: `${p.top}%`,
-                width: `${p.size}px`,
-                height: `${p.size}px`,
-                background:
-                  "radial-gradient(circle, rgba(186,230,253,0.95) 0%, rgba(125,211,252,0.4) 60%, transparent 100%)",
-                boxShadow: "0 0 6px rgba(125,211,252,0.6)",
-                animation: `ls-particle-${p.variant} ${p.duration}s ease-in ${p.delay}s infinite`,
-                willChange: "transform, opacity",
-              }}
-            />
-          ))}
+          <ParticlesProvider init={loadSlim}>
+            <Particles id="ls-particles" options={LS_PARTICLES_OPTIONS} />
+          </ParticlesProvider>
         </div>
 
         <div className="relative mx-auto max-w-6xl px-8 py-20">

@@ -14,11 +14,90 @@ export async function getModels(): Promise<ModelsInfo> {
   return res.data
 }
 
+// 记忆条目
+export interface MemoryItem {
+  id: string
+  user_id: string
+  content: string
+  category: string
+  source?: string
+  metadata?: Record<string, unknown>
+  created_at?: string
+}
+
+// 技能元数据
+export interface SkillMeta {
+  name: string
+  description: string
+  license?: string
+  compatibility?: string
+  metadata?: Record<string, unknown>
+}
+
+// GUI Agent 浏览结果
+export interface BrowseResult {
+  task: string
+  start_url: string
+  title: string
+  url: string
+  text_preview: string
+  links: { text: string; href: string }[]
+  screenshot_path: string | null
+  summary: string
+  steps: string[]
+}
+
+// 列出用户全部长期记忆
+export async function listMemories(
+  userId = "default",
+): Promise<{ items: MemoryItem[]; total: number }> {
+  const res = await client.get(`/api/memory/list`, {
+    params: { user_id: userId },
+  })
+  return { items: res.data.items || [], total: res.data.total || 0 }
+}
+
+// 删除单条记忆
+export async function deleteMemory(
+  memoryId: string,
+  userId = "default",
+): Promise<void> {
+  await client.delete(`/api/memory/${encodeURIComponent(memoryId)}`, {
+    params: { user_id: userId },
+  })
+}
+
+// 列出所有已注册技能
+export async function listSkills(): Promise<{
+  skills: SkillMeta[]
+  total: number
+}> {
+  const res = await client.get(`/api/skills`)
+  return { skills: res.data.skills || [], total: res.data.total || 0 }
+}
+
+// GUI Agent 浏览网页
+export async function browseUrl(
+  startUrl: string,
+  task?: string,
+): Promise<BrowseResult> {
+  const res = await client.post<BrowseResult>(`/api/gui/browse`, {
+    task: task || "打开网页并总结主要内容",
+    start_url: startUrl,
+    take_screenshot: false,
+    use_llm_summary: true,
+    use_browser: true,
+  })
+  return res.data
+}
+
 // SSE 流式多轮对话
 // onChunk: 每收到一个文本片段回调
 // onThinking: 收到编排步骤回调（如"分析用户输入..."、"检索法律知识库..."，离散列表）
 // onReasoning: 收到 LLM reasoning_content 片段回调（模型思考过程，横向流式段落）
 // onImage: 收到后端生成的图片URL回调（GLM-Image 生成结果）
+// onMemory: 收到记忆检索结果回调（用于前端展示"已参考 N 条历史记忆"）
+// onSkill: 收到技能匹配结果回调（用于前端展示"当前使用技能: XXX"）
 // onDone: 流结束回调
 // onError: 出错回调
 export async function streamMultiTurn(
@@ -34,6 +113,8 @@ export async function streamMultiTurn(
     onThinking?: (text: string) => void
     onReasoning?: (text: string) => void
     onImage?: (imageUrl: string) => void
+    onMemory?: (info: { count: number; items: { content: string; category: string }[] }) => void
+    onSkill?: (info: { name: string; description: string }) => void
     onDone?: () => void
     onError?: (err: string) => void
   },
@@ -90,6 +171,8 @@ export async function streamMultiTurn(
           if (obj.reasoning) opts.onReasoning?.(String(obj.reasoning))
           if (obj.text) opts.onChunk(obj.text)
           if (obj.image) opts.onImage?.(obj.image)
+          if (obj.memory) opts.onMemory?.(obj.memory)
+          if (obj.skill) opts.onSkill?.(obj.skill)
           if (obj.error) opts.onError?.(obj.error)
           if (obj.done) {
             opts.onDone?.()

@@ -7,6 +7,10 @@ interface MapRotationDialProps {
   onChange: (angle: number) => void
   /** 重置朝北（点击中心按钮） */
   onReset?: () => void
+  /** 当前俯视角度 0-60 */
+  pitch?: number
+  /** pitch 变更回调 */
+  onPitchChange?: (pitch: number) => void
 }
 
 /** 规范化角度到 0-360 */
@@ -27,6 +31,8 @@ export default function MapRotationDial({
   bearing,
   onChange,
   onReset,
+  pitch,
+  onPitchChange,
 }: MapRotationDialProps) {
   const svgRef = useRef<SVGSVGElement>(null)
   const [dragging, setDragging] = useState(false)
@@ -264,6 +270,35 @@ export default function MapRotationDial({
           </button>
         )}
       </div>
+
+      {/* pitch 垂直滑块（仅当 pitch 和 onPitchChange 都传入时渲染） */}
+      {pitch !== undefined && onPitchChange !== undefined && (
+        <div className="pointer-events-auto mt-1 flex flex-col items-center gap-1 rounded-md bg-white/25 px-2 py-2 shadow-sm backdrop-blur-md">
+          <span className="text-[10px] font-medium text-white">俯视</span>
+          <input
+            type="range"
+            min={0}
+            max={60}
+            value={pitch}
+            onChange={(e) => onPitchChange(Number(e.target.value))}
+            className="ls-pitch-slider cursor-pointer"
+            style={{
+              writingMode: 'vertical-lr',
+              direction: 'rtl',
+              width: 8,
+              height: 100,
+              accentColor: '#fbbf24',
+            }}
+            aria-label="俯视角度"
+            aria-valuemin={0}
+            aria-valuemax={60}
+            aria-valuenow={Math.round(pitch)}
+          />
+          <span className="text-[10px] font-medium text-white">
+            {Math.round(pitch)}°
+          </span>
+        </div>
+      )}
     </div>
   )
 }

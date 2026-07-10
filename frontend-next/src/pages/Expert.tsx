@@ -10,6 +10,8 @@ import {
   Gavel,
   MessageCircleQuestion,
   Send,
+  Wrench,
+  ChevronDown,
 } from "lucide-react"
 import {
   streamTrial,
@@ -20,6 +22,7 @@ import {
   type UserQuestion,
   type TrialVerdict,
   type EvidenceItem,
+  type ToolCallRecord,
 } from "@/api/expert"
 import { MarkdownRenderer } from "@/components/shared/MarkdownRenderer"
 import { ThinkingPanel } from "@/components/shared/ThinkingPanel"
@@ -138,6 +141,10 @@ export default function Expert() {
   >({})
   // 法官证据梳理清单
   const [evidenceList, setEvidenceList] = useState<EvidenceItem[]>([])
+  // Agent 工具调用记录（按角色累积 tool_call/tool_result 事件，展示自主 Agent plan→tool→final）
+  const [toolCallsByRole, setToolCallsByRole] = useState<
+    Record<string, ToolCallRecord[]>
+  >({})
   // 判决打回提示（法官被打回重判时显示，保持 loading 态直到最终 verdict）
   const [verdictRebuttalMsg, setVerdictRebuttalMsg] = useState<string | null>(
     null,
@@ -203,6 +210,7 @@ export default function Expert() {
     setEvidenceList([])
     setVerdictRebuttalMsg(null)
     setCurrentlyThinking(null)
+    setToolCallsByRole({})
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -269,6 +277,26 @@ export default function Expert() {
               )
             }
             return prev
+          })
+        },
+        onToolCall: (role, tool, input, round) => {
+          setToolCallsByRole((prev) => {
+            const list = prev[role] ? [...prev[role]!] : []
+            list.push({ role, tool, input, round, output: undefined })
+            return { ...prev, [role]: list }
+          })
+        },
+        onToolResult: (role, tool, output, _round) => {
+          setToolCallsByRole((prev) => {
+            const oldList = prev[role] || []
+            const newList = [...oldList]
+            for (let i = newList.length - 1; i >= 0; i--) {
+              if (newList[i].tool === tool && newList[i].output === undefined) {
+                newList[i] = { ...newList[i], output }
+                break
+              }
+            }
+            return { ...prev, [role]: newList }
           })
         },
         onUserQuestion: (q) => {
@@ -367,6 +395,7 @@ export default function Expert() {
     setEvidenceList([])
     setVerdictRebuttalMsg(null)
     setCurrentlyThinking(null)
+    setToolCallsByRole({})
   }, [isRunning, handleStop])
 
   // 导出庭审记录
@@ -678,6 +707,12 @@ export default function Expert() {
               </div>
             )}
 
+            {/* Agent 工具调用折叠面板（自主 Agent plan→tool→final 模式展示） */}
+            <ToolCallPanel
+              toolCallsByRole={toolCallsByRole}
+              planStepsByRole={thinkingStepsByRole}
+            />
+
             {/* 法官席（底部） */}
             <CourtArea
               title="法官席"
@@ -780,6 +815,141 @@ function CourtArea({
           ))
         )}
       </div>
+    </div>
+  )
+}
+
+// ========== 子组件：Agent 工具调用折叠面板 ==========
+
+interface ToolCallPanelProps {
+  toolCallsByRole: Record<string, ToolCallRecord[]>
+  /** 自主 Agent 的 plan 步骤（用 thinking_note 近似展示） */
+  planStepsByRole: Record<string, string[]>
+}
+
+function ToolCallPanel({
+  toolCallsByRole,
+  planStepsByRole,
+}: ToolCallPanelProps) {
+  const [expanded, setExpanded] = useState(true)
+  // 角色出场顺序
+  const roleOrder: TrialRole[] = [
+    "chief_judge",
+    "plaintiff",
+    "defendant",
+    "judge",
+  ]
+  const roles = roleOrder.filter(
+    (r) =>
+      (toolCallsByRole[r]?.length ?? 0) > 0 ||
+      (planStepsByRole[r]?.length ?? 0) > 0,
+  )
+  const totalTools = roles.reduce(
+    (sum, r) => sum + (toolCallsByRole[r]?.length ?? 0),
+    0,
+  )
+  if (totalTools === 0 && roles.length === 0) return null
+
+  return (
+    <div className="rounded-xl border border-teal-200 bg-teal-50/40">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-sm font-medium text-teal-800 transition hover:bg-teal-100/40"
+      >
+        <Wrench className="h-4 w-4 text-teal-600" />
+        <span className="flex-1">Agent 工具调用</span>
+        {totalTools > 0 && (
+          <span className="text-xs text-teal-500">{totalTools} 次调用</span>
+        )}
+        <ChevronDown
+          className={cn(
+            "h-4 w-4 transition-transform",
+            expanded && "rotate-180",
+          )}
+        />
+      </button>
+      {expanded && (
+        <div className="space-y-3 border-t border-teal-100 px-4 py-3">
+          {roles.map((role) => {
+            const info = ROLE_INFO[role]
+            const calls = toolCallsByRole[role] || []
+            const steps = planStepsByRole[role] || []
+            return (
+              <div
+                key={role}
+                className="rounded-lg border border-teal-100 bg-white/60 p-3"
+              >
+                <div className="mb-2 flex items-center gap-2">
+                  <span
+                    className={cn(
+                      "rounded px-2 py-0.5 text-xs font-medium",
+                      info.badge,
+                    )}
+                  >
+                    {info.emoji} {info.label}
+                  </span>
+                </div>
+                {/* plan 步骤（自主 Agent 的 plan 阶段，用 thinking_note 近似展示） */}
+                {steps.length > 0 && (
+                  <div className="mb-2">
+                    <p className="mb-1 text-[11px] font-medium text-teal-600">
+                      规划
+                    </p>
+                    <p className="whitespace-pre-wrap break-words text-xs leading-relaxed text-gray-600">
+                      {steps.join(" ")}
+                    </p>
+                  </div>
+                )}
+                {/* 工具调用记录（tool 阶段） */}
+                {calls.length > 0 ? (
+                  <div className="space-y-2">
+                    <p className="text-[11px] font-medium text-teal-600">
+                      工具调用
+                    </p>
+                    {calls.map((c, i) => (
+                      <div
+                        key={i}
+                        className="rounded-md border border-teal-100 bg-teal-50/40 px-3 py-2 text-xs"
+                      >
+                        <div className="mb-1 flex items-center gap-2">
+                          <span className="rounded bg-teal-100 px-1.5 py-0.5 font-mono text-[11px] text-teal-700">
+                            {c.tool}
+                          </span>
+                          <span className="text-gray-400">
+                            第 {c.round} 轮
+                          </span>
+                          {c.output === undefined && (
+                            <Loader2 className="h-3 w-3 animate-spin text-teal-400" />
+                          )}
+                        </div>
+                        {c.input && (
+                          <div className="mb-1">
+                            <span className="text-gray-400">输入：</span>
+                            <span className="whitespace-pre-wrap break-words text-gray-600">
+                              {c.input}
+                            </span>
+                          </div>
+                        )}
+                        {c.output !== undefined && c.output && (
+                          <div>
+                            <span className="text-gray-400">结果：</span>
+                            <span className="whitespace-pre-wrap break-words text-gray-600">
+                              {c.output}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-gray-400">暂无工具调用</p>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

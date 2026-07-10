@@ -101,13 +101,16 @@ class CourtSubAgent:
         1. 调用 ``_retrieve_law_context`` 自主检索相关法律条文（RAG，超时 5s）
         2. 构建 system_prompt = 基础角色 prompt + 检索到的法律条文
         3. 调用 ``gateway.chat_stream_with_reasoning`` 流式生成
-        4. 流式结束后若 content 为空但 reasoning 非空，yield 一次 ('content', reasoning) 作 fallback
+        4. 若流式过程中始终未 yield 任何 content（如 GLM-4.7-Flash 将内容放在
+           reasoning_content，content 字段为空），立即将 reasoning 分段 yield 为
+           content，模拟流式效果，避免发言区域流式过程中为空。
         """
         law_context = await self._retrieve_law_context(f"{context} {case}")
         messages = self._build_speak_messages(context, case, history, law_context)
 
         content_acc = ""
         reasoning_acc = ""
+        has_yielded_content = False  # 跟踪是否已 yield content，避免发言区流式过程中为空
 
         try:
             async for kind, text in self.gateway.chat_stream_with_reasoning(
@@ -121,14 +124,20 @@ class CourtSubAgent:
                     yield ("reasoning", text)
                 else:  # content
                     content_acc += text
+                    has_yielded_content = True
                     yield ("content", text)
         except LLMGatewayError:
             if not content_acc:
                 yield ("content", f"（{self.role_label}暂无回应，LLM 调用失败）")
+                has_yielded_content = True
 
-        # content 为空但 reasoning 非空，回退用 reasoning 作为发言
-        if not content_acc and reasoning_acc:
-            yield ("content", reasoning_acc)
+        # 关键修复：若流式过程中未 yield 任何 content，立即将 reasoning 分段 yield 为
+        # content（每段 50 字），模拟流式效果。旧逻辑在流式结束后一次性 yield 整段
+        # reasoning，导致流式过程中发言区域始终为空显示"等待发言"。
+        if not has_yielded_content and reasoning_acc:
+            chunk_size = 50
+            for i in range(0, len(reasoning_acc), chunk_size):
+                yield ("content", reasoning_acc[i : i + chunk_size])
 
     async def answer_question(
         self,
@@ -142,6 +151,7 @@ class CourtSubAgent:
 
         content_acc = ""
         reasoning_acc = ""
+        has_yielded_content = False  # 跟踪是否已 yield content，避免发言区流式过程中为空
 
         try:
             async for kind, text in self.gateway.chat_stream_with_reasoning(
@@ -155,13 +165,19 @@ class CourtSubAgent:
                     yield ("reasoning", text)
                 else:  # content
                     content_acc += text
+                    has_yielded_content = True
                     yield ("content", text)
         except LLMGatewayError:
             if not content_acc:
                 yield ("content", f"（{self.role_label}暂无回应，LLM 调用失败）")
+                has_yielded_content = True
 
-        if not content_acc and reasoning_acc:
-            yield ("content", reasoning_acc)
+        # 关键修复：若流式过程中未 yield 任何 content，立即将 reasoning 分段 yield 为
+        # content（每段 50 字），模拟流式效果（与 speak() 一致）。
+        if not has_yielded_content and reasoning_acc:
+            chunk_size = 50
+            for i in range(0, len(reasoning_acc), chunk_size):
+                yield ("content", reasoning_acc[i : i + chunk_size])
 
     # ---------- RAG 检索 ----------
 
@@ -383,6 +399,8 @@ class JudgeAgent(CourtSubAgent):
     _DUANSHUI_PATTERNS = (
         "各50%", "各50％", "50%对50%", "50％对50％", "各占50", "一半一半",
         "各打五十大板", "各承担50",
+        "双方各有道理", "难以判定", "各承担一半", "各占一半",
+        "双方都有责任", "双方都有过错", "各执一词",
     )
 
     def __init__(
@@ -450,7 +468,10 @@ class JudgeAgent(CourtSubAgent):
             f"- 如果存在实质性疑点（证据链断裂、事实矛盾、法律适用争议、关键证据缺失），追问\n"
             f"- 如果本轮已充分辩论、无实质疑点，不追问\n"
             f"- 不要为了追问而追问，但也不要放过真正的疑点\n"
-            f"- 你是犀利法官，发现漏洞就要追问，不和稀泥\n\n"
+            f"- 你是犀利法官，发现漏洞就要追问，不和稀泥\n"
+            f"- 如果原告或被告在之前的回答中表示\"不清楚/不知道/无法确认\"关键事实，你必须 target=\"user\" 向当事人（用户）追问该关键事实\n"
+            f"- 追问内容必须具体：如\"您是否持有书面合同？\"、\"付款时间线是否清晰？\"、\"是否有转账记录？\"\n"
+            f"- 禁止在原被告表示不清楚且未向用户追问的情况下直接做出\"无法判断\"判决\n\n"
             f"请严格按以下 JSON 格式输出（不要输出其他文字、不要 markdown 代码块）：\n"
             f'{{\n'
             f'  "should_ask": true 或 false,\n'

@@ -8,6 +8,32 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
+// 智能合并碎片：将短碎片合并为横向段落，避免竖向逐字显示
+// - 完整的编排提示（长度>20、以 "..." 或 "。" 结尾）保留为独立 step
+// - 短碎片累积合并为 paragraph，横向流式展示
+function mergeSteps(
+  steps: string[],
+): { type: "step" | "paragraph"; text: string }[] {
+  const result: { type: "step" | "paragraph"; text: string }[] = []
+  let paragraphBuffer = ""
+  for (const step of steps) {
+    if (step.length > 20 || step.endsWith("...") || step.endsWith("。")) {
+      if (paragraphBuffer) {
+        result.push({ type: "paragraph", text: paragraphBuffer })
+        paragraphBuffer = ""
+      }
+      result.push({ type: "step", text: step })
+    } else {
+      // 短碎片合并为段落
+      paragraphBuffer += step
+    }
+  }
+  if (paragraphBuffer) {
+    result.push({ type: "paragraph", text: paragraphBuffer })
+  }
+  return result
+}
+
 // 可折叠的"思考过程/分析过程"面板
 // 用于：
 //   1. AI 回复前的思考过程（步骤列表，蓝色基调）
@@ -65,6 +91,8 @@ export function ThinkingPanel({
   }, [thinking])
 
   const hasSteps = !!steps && steps.length > 0
+  // 智能合并碎片：短碎片合并为横向段落，完整提示保留为独立步骤
+  const mergedSteps = hasSteps ? mergeSteps(steps!) : []
   // 防御：content 若为数组（旧数据残留），自动 join("")；非字符串强制转字符串
   const contentStr = Array.isArray(content)
     ? content.join("")
@@ -117,7 +145,7 @@ export function ThinkingPanel({
               isVision ? "text-purple-400" : "text-blue-400",
             )}
           >
-            {steps!.length} 步
+            {mergedSteps.length} 步
           </span>
         )}
         <ChevronDown
@@ -136,21 +164,30 @@ export function ThinkingPanel({
           )}
         >
           {hasSteps && (
-            <ol className="space-y-1">
-              {steps!.map((s, i) => (
-                <li key={i} className="flex gap-1.5">
-                  <span
-                    className={cn(
-                      "shrink-0",
-                      isVision ? "text-purple-400" : "text-blue-400",
-                    )}
+            <div className="space-y-1">
+              {mergedSteps.map((item, i) =>
+                item.type === "step" ? (
+                  <div key={i} className="flex gap-1.5">
+                    <span
+                      className={cn(
+                        "shrink-0",
+                        isVision ? "text-purple-400" : "text-blue-400",
+                      )}
+                    >
+                      ›
+                    </span>
+                    <span className="whitespace-pre-wrap">{item.text}</span>
+                  </div>
+                ) : (
+                  <p
+                    key={i}
+                    className="whitespace-pre-wrap break-words pl-3"
                   >
-                    ›
-                  </span>
-                  <span className="whitespace-pre-wrap">{s}</span>
-                </li>
-              ))}
-            </ol>
+                    {item.text}
+                  </p>
+                ),
+              )}
+            </div>
           )}
           {hasContentText && (
             <p className="whitespace-pre-wrap break-words">{contentStr}</p>

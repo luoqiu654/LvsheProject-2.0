@@ -236,6 +236,26 @@ async def skill_run(request: SkillRunRequest) -> SkillRunResponse:
     )
 
 
+@router.get("/skills")
+async def skills_list():
+    """列出所有已注册的 Agent Skills 元数据。"""
+    metas = skill_executor.registry.list_metadata()
+    return {
+        "ok": True,
+        "skills": [
+            {
+                "name": m.name,
+                "description": m.description,
+                "license": m.license,
+                "compatibility": m.compatibility,
+                "metadata": m.metadata or {},
+            }
+            for m in metas
+        ],
+        "total": len(metas),
+    }
+
+
 @router.post("/memory/chat", response_model=MemoryChatResponse)
 async def memory_chat(request: MemoryChatRequest) -> MemoryChatResponse:
     result = await memory_manager.chat_with_memory(
@@ -258,6 +278,28 @@ async def memory_chat(request: MemoryChatRequest) -> MemoryChatResponse:
         answer=result["answer"],
         saved_memories=saved_memories,
     )
+
+
+@router.get("/memory/list")
+async def memory_list(user_id: str = "default"):
+    """列出指定用户的全部长期记忆。"""
+    records = memory_manager.get_all(user_id=user_id)
+    items = []
+    for r in records:
+        if hasattr(r, "__dataclass_fields__"):
+            items.append(asdict(r))
+        else:
+            items.append({"raw": str(r)})
+    return {"ok": True, "user_id": user_id, "items": items, "total": len(items)}
+
+
+@router.delete("/memory/{memory_id}")
+async def memory_delete(memory_id: str, user_id: str = "default"):
+    """删除指定用户的单条长期记忆。"""
+    deleted = memory_manager.delete_one(memory_id=memory_id, user_id=user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="记忆不存在或无权删除")
+    return {"ok": True, "deleted": memory_id}
 
 
 @router.post("/gui/browse", response_model=GUIBrowseResponse)
@@ -494,6 +536,36 @@ def _is_image_gen_request(text: str) -> bool:
     return any(k in text for k in _IMAGE_GEN_KEYWORDS)
 
 
+def _augment_system_prompt(
+    messages: list[dict],
+    memory_context_text: str = "",
+    skill_name: str = "",
+    skill_instructions: str = "",
+) -> None:
+    """
+    将记忆上下文和 skill 指令注入 system prompt（原地修改 messages）。
+
+    - 若首条消息是 system，则追加；否则插入新的 system 消息。
+    - 记忆上下文让 LLM 参考用户长期偏好与历史。
+    - skill 指令让 LLM 按技能规范回答。
+    """
+    extra_parts: list[str] = []
+    if memory_context_text:
+        extra_parts.append(memory_context_text)
+    if skill_instructions:
+        extra_parts.append(
+            f"当前已激活技能「{skill_name}」，请遵循以下技能指令回答：\n{skill_instructions}"
+        )
+    if not extra_parts:
+        return
+    extra = "\n\n".join(extra_parts)
+
+    if messages and messages[0]["role"] == "system":
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + extra
+    else:
+        messages.insert(0, {"role": "system", "content": extra})
+
+
 @router.post("/chat/multi-turn")
 async def chat_multi_turn(request: MultiTurnChatRequest):
     """
@@ -562,17 +634,58 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                 for m in reversed(matches):
                     name = m.group(1).strip()
                     data_url = m.group(2)
-                    try:
-                        vision_result = await gateway.chat_with_vision(
-                            image=data_url,
-                            prompt="请详细描述这张图片的内容，特别关注其中可能涉及的法律相关信息，如合同、证件、票据、现场照片等。",
-                        )
+                    # 重试机制：最多重试 1 次，失败后 sleep 0.5s 再试
+                    vision_result = None
+                    vision_error = None
+                    for attempt in range(2):
+                        try:
+                            vision_result = await gateway.chat_with_vision(
+                                image=data_url,
+                                prompt="请详细描述这张图片的内容，特别关注其中可能涉及的法律相关信息，如合同、证件、票据、现场照片等。",
+                            )
+                            break
+                        except Exception as exc:
+                            vision_error = exc
+                            if attempt < 1:
+                                await asyncio.sleep(0.5)
+
+                    if vision_result is not None:
                         replacement = (
                             f"[附件图片: {name}]\n视觉分析结果：{vision_result}\n[/附件图片]"
                         )
-                    except Exception as exc:
+                    else:
+                        # 友好的错误信息，区分网络错误、模型错误、图片格式错误
+                        error_str = str(vision_error)
+                        cause_str = (
+                            str(vision_error.__cause__)
+                            if vision_error and vision_error.__cause__
+                            else ""
+                        )
+                        combined = (error_str + " " + cause_str).lower()
+                        if any(
+                            kw in combined
+                            for kw in [
+                                "connect",
+                                "timeout",
+                                "network",
+                                "connection",
+                                "unreachable",
+                            ]
+                        ):
+                            friendly = "网络连接异常，请检查网络后重试"
+                        elif any(
+                            kw in combined
+                            for kw in ["图片", "format", "mime", "过大", "compress", "png", "jpeg"]
+                        ):
+                            friendly = "图片格式不支持或图片过大，请更换图片后重试"
+                        elif any(
+                            kw in combined for kw in ["model", "glm", "api", "key", "auth"]
+                        ):
+                            friendly = "视觉模型服务暂时不可用，请稍后重试"
+                        else:
+                            friendly = f"视觉分析失败：{vision_error}"
                         replacement = (
-                            f"[附件图片: {name}]\n视觉分析结果：（视觉分析失败：{exc}）\n[/附件图片]"
+                            f"[附件图片: {name}]\n视觉分析结果：（{friendly}）\n[/附件图片]"
                         )
                     content = content[:m.start()] + replacement + content[m.end():]
                 raw_messages[i]["content"] = content
@@ -606,6 +719,67 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                         pass
                 yield f"data: {json.dumps({'thinking': f'找到 {contexts_count} 条相关法律条文'}, ensure_ascii=False)}\n\n"
 
+            # ===== Agent Memory：检索用户长期记忆并注入上下文 =====
+            memory_count = 0
+            memory_items_for_frontend: list[dict] = []
+            memory_context_text = ""
+            if last_user_msg:
+                yield f"data: {json.dumps({'thinking': '正在检索用户记忆...'}, ensure_ascii=False)}\n\n"
+                try:
+                    memory_results = memory_manager.recall(
+                        query=last_user_msg,
+                        user_id="default",
+                        limit=5,
+                    )
+                    memory_count = len(memory_results) if memory_results else 0
+                    if memory_results:
+                        from backend.core.memory import MemorySearchResult as _MSR
+                        lines = ["用户相关长期记忆（请在回答时参考）："]
+                        for item in memory_results:
+                            if isinstance(item, _MSR):
+                                lines.append(
+                                    f"- [{item.record.category}] {item.record.content}"
+                                )
+                                memory_items_for_frontend.append({
+                                    "content": item.record.content,
+                                    "category": item.record.category,
+                                })
+                            else:
+                                lines.append(f"- {item}")
+                        memory_context_text = "\n".join(lines)
+                except Exception:
+                    # 记忆检索失败不阻断对话
+                    memory_context_text = ""
+                yield f"data: {json.dumps({'thinking': f'已参考 {memory_count} 条历史记忆'}, ensure_ascii=False)}\n\n"
+                if memory_items_for_frontend:
+                    yield f"data: {json.dumps({'memory': {'count': memory_count, 'items': memory_items_for_frontend}}, ensure_ascii=False)}\n\n"
+
+            # ===== Agent Skills：匹配技能并注入 skill 指令 =====
+            matched_skill_name = ""
+            matched_skill_desc = ""
+            skill_instructions = ""
+            if last_user_msg:
+                yield f"data: {json.dumps({'thinking': '正在匹配技能...'}, ensure_ascii=False)}\n\n"
+                try:
+                    matched_skill = skill_executor.registry.match(last_user_msg)
+                    if matched_skill is not None:
+                        matched_skill_name = matched_skill.name
+                        matched_skill_desc = matched_skill.description
+                        skill_instructions = matched_skill.instructions or ""
+                        yield f"data: {json.dumps({'skill': {'name': matched_skill_name, 'description': matched_skill_desc}}, ensure_ascii=False)}\n\n"
+                except Exception:
+                    # 技能匹配失败不阻断对话
+                    pass
+
+            # 将记忆上下文 + skill 指令注入 system prompt
+            if memory_context_text or skill_instructions:
+                _augment_system_prompt(
+                    raw_messages,
+                    memory_context_text=memory_context_text,
+                    skill_name=matched_skill_name,
+                    skill_instructions=skill_instructions,
+                )
+
             # ===== 正常流程：流式生成回复（含思考过程）=====
             yield f"data: {json.dumps({'thinking': '生成回复...'}, ensure_ascii=False)}\n\n"
 
@@ -613,6 +787,7 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
             # GLM-4.7-Flash 会先输出 reasoning_content（思考过程），再输出 content（正式回答）
             # 编排步骤（如"分析用户输入..."）保留 thinking 字段（离散列表）；
             # LLM 的 reasoning_content 改发 reasoning 字段（横向流式段落），与 thinking 严格分离
+            assistant_full_text = ""
             async for typ, text in gateway.chat_stream_with_reasoning(
                 messages=raw_messages,
                 model=request.model,
@@ -622,7 +797,20 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                 if typ == "reasoning":
                     yield f"data: {json.dumps({'reasoning': text}, ensure_ascii=False)}\n\n"
                 else:
+                    assistant_full_text += text
                     yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
+
+            # ===== Agent Memory：对话结束后提取并保存长期记忆 =====
+            if last_user_msg and assistant_full_text.strip():
+                try:
+                    memory_manager.remember_interaction(
+                        user_message=last_user_msg,
+                        assistant_message=assistant_full_text,
+                        user_id="default",
+                    )
+                except Exception:
+                    # 记忆保存失败不影响已生成的回答
+                    pass
 
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
 

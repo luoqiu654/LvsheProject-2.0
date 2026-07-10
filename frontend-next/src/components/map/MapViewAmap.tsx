@@ -69,6 +69,10 @@ interface MapViewAmapProps {
   bearing?: number
   /** 当 nonce 变化时，应用 bearing 到地图视角 */
   bearingNonce?: number
+  /** 当前俯视角度 0-60（由外部拨盘控制） */
+  pitch?: number
+  /** 当 nonce 变化时，应用 pitch 到地图视角 */
+  pitchNonce?: number
   /** 初始视图（用于模式切换时保持中心/缩放），仅首次初始化生效 */
   initialView?: { center: [number, number]; zoom: number }
   /** 地图移动结束时回调，用于上报当前视图状态 */
@@ -87,6 +91,8 @@ export default function MapViewAmap({
   flyTarget,
   bearing,
   bearingNonce,
+  pitch,
+  pitchNonce,
   initialView,
   onViewChange,
 }: MapViewAmapProps) {
@@ -339,6 +345,25 @@ export default function MapViewAmap({
     // 仅依赖 nonce 变化触发
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bearingNonce, mapReady])
+
+  // 外部拨盘触发俯视角度变化（高德 JS API 2.0 支持 setPitch）
+  useEffect(() => {
+    if (!mapReady) return
+    const map = mapRef.current
+    if (!map || pitch === undefined || pitchNonce === undefined) return
+    // 初始 nonce=0 跳过（首次渲染，避免覆盖地图初始 pitch）
+    if (pitchNonce === 0) return
+
+    try {
+      if (typeof map.setPitch === 'function') {
+        map.setPitch(pitch as number)
+      }
+    } catch (err) {
+      console.warn('[MapViewAmap] setPitch failed:', err)
+    }
+    // 仅依赖 nonce 变化触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pitchNonce, mapReady])
 
   // 组件卸载时清理 rAF
   useEffect(() => {

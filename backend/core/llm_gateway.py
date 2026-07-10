@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -23,6 +24,19 @@ def _mask_api_key(key: str, min_show: int = 6) -> str:
     if len(s) <= min_show + 4:
         return s[:4] + "*" * (len(s) - 4)
     return s[:min_show] + "*" * (len(s) - min_show - 4) + s[-4:]
+
+
+def _detect_mime_from_bytes(data: bytes) -> str:
+    """通过图片字节头判断实际 MIME 类型（不依赖文件扩展名）。"""
+    if len(data) >= 4 and data[:4] == b'\x89PNG':
+        return "png"
+    if len(data) >= 2 and data[:2] == b'\xff\xd8':
+        return "jpeg"
+    if len(data) >= 6 and data[:6] in (b'GIF87a', b'GIF89a'):
+        return "gif"
+    if len(data) >= 12 and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "webp"
+    return "png"
 
 
 @dataclass(frozen=True)
@@ -477,6 +491,33 @@ class LLMGateway:
         # 将图片转为 base64 data URL
         image_data_url = self._image_to_data_url(image)
 
+        # 图片大小检查：base64 编码后过长时拒绝（避免请求超时或超出模型限制）
+        b64_payload = (
+            image_data_url.split(",", 1)[1]
+            if "," in image_data_url
+            else image_data_url
+        )
+        if len(b64_payload) > 5_000_000:
+            raise LLMGatewayError(
+                f"图片过大，base64 编码后长度约 {len(b64_payload)} 字符"
+                f"（上限 5000000）。请压缩图片后重试。"
+            )
+
+        # 模型名校验：确保使用有效的智谱视觉模型名（glm-ocr）
+        if "glm-ocr" not in model_name.lower():
+            print(
+                f"[LLMGateway] 视觉模型名 '{model_name}' 非有效智谱视觉模型，"
+                f"强制使用 glm-ocr"
+            )
+            model_name = "glm-ocr"
+
+        # 详细日志（调试用）
+        print(f"[LLMGateway] chat_with_vision 调用参数：")
+        print(f"  model_name: {model_name}")
+        print(f"  api_base: {config.api_base}")
+        print(f"  image_data_url (前80字符): {image_data_url[:80]}")
+        print(f"  image_base64_size: {len(b64_payload)} 字符")
+
         messages = [
             {"role": "system", "content": system_message},
             {
@@ -500,9 +541,13 @@ class LLMGateway:
             return self.extract_text(response)
 
         except Exception as exc:
+            print(f"[LLMGateway] 视觉模型调用失败，model={model_name}")
+            print(f"  错误类型: {type(exc).__name__}")
+            print(f"  错误信息: {exc}")
+            traceback.print_exc()
             raise LLMGatewayError(
                 f"调用视觉模型失败，model={model_name}。"
-                f"错误信息：{exc}"
+                f"错误类型：{type(exc).__name__}，错误信息：{exc}"
             ) from exc
 
     def _image_to_data_url(self, image: str | Path | bytes) -> str:
@@ -513,6 +558,8 @@ class LLMGateway:
         - 文件路径
         - base64 字符串（已编码）
         - 图片字节
+
+        MIME 类型通过图片字节头自动检测（不依赖扩展名）。
         """
         # 如果已经是 data URL 格式
         if isinstance(image, str) and image.startswith("data:image"):
@@ -522,8 +569,13 @@ class LLMGateway:
         if isinstance(image, str) and not image.startswith("/") and not image.startswith("data:"):
             # 尝试判断是否是文件路径
             if not Path(image).exists():
-                # 假设是 base64 字符串
-                return f"data:image/png;base64,{image}"
+                # 假设是 base64 字符串，解码后通过字节头检测 MIME 类型
+                try:
+                    decoded = base64.b64decode(image)
+                    mime_ext = _detect_mime_from_bytes(decoded)
+                except Exception:
+                    mime_ext = "png"
+                return f"data:image/{mime_ext};base64,{image}"
 
         # 从文件读取
         if isinstance(image, (str, Path)):
@@ -531,16 +583,13 @@ class LLMGateway:
             if not path.exists():
                 raise LLMGatewayError(f"图片文件不存在：{image}")
 
-            ext = path.suffix.lower().lstrip(".")
-            # 标准化扩展名
-            ext_map = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp", "bmp": "bmp"}
-            mime_ext = ext_map.get(ext, "png")
-
             image_bytes = path.read_bytes()
+            # 优先通过字节头检测实际格式，扩展名仅作 fallback
+            mime_ext = _detect_mime_from_bytes(image_bytes)
         else:
-            # 字节
+            # 字节输入：通过字节头检测 MIME 类型（而非固定 png）
             image_bytes = image
-            mime_ext = "png"
+            mime_ext = _detect_mime_from_bytes(image_bytes)
 
         base64_str = base64.b64encode(image_bytes).decode("utf-8")
         return f"data:image/{mime_ext};base64,{base64_str}"

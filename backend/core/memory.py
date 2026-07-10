@@ -172,6 +172,20 @@ class LocalMemoryStore:
         self._write_all(kept)
         return deleted_count
 
+    def delete_one(self, memory_id: str, user_id: str = "default_user") -> bool:
+        """删除单条记忆，仅在 user_id 匹配时生效。返回是否删除成功。"""
+        records = self._read_all()
+        before = len(records)
+        kept = [
+            record
+            for record in records
+            if not (record.id == memory_id and record.user_id == user_id)
+        ]
+        if len(kept) == before:
+            return False
+        self._write_all(kept)
+        return True
+
     def count(self, user_id: str | None = None) -> int:
         records = self._read_all()
         if user_id is None:
@@ -403,6 +417,12 @@ class LegalMemoryManager:
         if hasattr(self.store, "delete_all"):
             return self.store.delete_all(user_id=user_id)
         raise RuntimeError("当前 memory backend 不支持 delete_all")
+
+    def delete_one(self, memory_id: str, user_id: str = "default_user") -> bool:
+        """删除单条记忆。"""
+        if hasattr(self.store, "delete_one"):
+            return self.store.delete_one(memory_id=memory_id, user_id=user_id)
+        raise RuntimeError("当前 memory backend 不支持 delete_one")
 
     def extract_memories_from_interaction(
         self,

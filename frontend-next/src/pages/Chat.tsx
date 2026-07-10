@@ -11,9 +11,25 @@ import {
   Loader,
   FileText,
   Image as ImageIcon,
+  Brain,
+  Wrench,
+  ChevronDown,
+  ExternalLink,
+  Globe,
 } from "lucide-react"
 import { useChatStore } from "@/stores/chatStore"
-import { streamMultiTurn, getModels, type ModelsInfo } from "@/api/chat"
+import {
+  streamMultiTurn,
+  getModels,
+  listMemories,
+  deleteMemory,
+  listSkills,
+  browseUrl,
+  type ModelsInfo,
+  type MemoryItem,
+  type SkillMeta,
+  type BrowseResult,
+} from "@/api/chat"
 import { analyzeImage, parseDocument } from "@/api/files"
 import type { Attachment } from "@/types/chat"
 import type { Message } from "@/types/chat"
@@ -60,6 +76,28 @@ const SYSTEM_PROMPT =
   "请用清晰易懂的语言回答用户的法律问题，必要时引用相关法律条文。" +
   "回答使用 Markdown 格式，重点内容加粗。"
 
+// 检测用户输入中的 URL，触发 GUI Agent 浏览
+function extractUrls(text: string): string[] {
+  const matches = text.match(/https?:\/\/[^\s<>"')\]]+/gi)
+  return matches ? Array.from(new Set(matches)) : []
+}
+
+// 是否要求"搜索最新法律"
+function isLatestLawSearch(text: string): boolean {
+  return /搜索最新法律|最新法律|最新法条|最新法规|查找最新/.test(text)
+}
+
+// 格式化记忆时间
+function formatMemoryTime(iso?: string): string {
+  if (!iso) return ""
+  try {
+    const d = new Date(iso)
+    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`
+  } catch {
+    return ""
+  }
+}
+
 export default function Chat() {
   const {
     conversations,
@@ -99,6 +137,30 @@ export default function Chat() {
   const [generatedImages, setGeneratedImages] = useState<
     Record<string, string[]>
   >({})
+  // AI 消息 ID -> 当前匹配的技能 {name, description}
+  const [skillByMsg, setSkillByMsg] = useState<
+    Record<string, { name: string; description: string }>
+  >({})
+  // AI 消息 ID -> 浏览结果列表（GUI Agent）
+  const [browseResultsByMsg, setBrowseResultsByMsg] = useState<
+    Record<string, BrowseResult[]>
+  >({})
+  // AI 消息 ID -> 浏览状态提示（如"正在浏览网页: XXX"）
+  const [browseStatusByMsg, setBrowseStatusByMsg] = useState<
+    Record<string, string>
+  >({})
+  // 展开的浏览卡片索引（"msgId-index" 形式），null 表示折叠
+  const [expandedBrowseKey, setExpandedBrowseKey] = useState<string | null>(
+    null,
+  )
+  // 侧边栏：我的记忆
+  const [memories, setMemories] = useState<MemoryItem[]>([])
+  const [memoryPanelOpen, setMemoryPanelOpen] = useState(true)
+  // 侧边栏：技能市场
+  const [skills, setSkills] = useState<SkillMeta[]>([])
+  const [skillsPanelOpen, setSkillsPanelOpen] = useState(true)
+  // 选中的技能（仅高亮展示，不影响后端自动匹配）
+  const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -107,6 +169,24 @@ export default function Chat() {
   // 获取模型列表
   useEffect(() => {
     getModels().then(setModels).catch(() => {})
+  }, [])
+
+  // 加载用户记忆列表
+  const refreshMemories = useCallback(() => {
+    listMemories("default")
+      .then((data) => setMemories(data.items))
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refreshMemories()
+  }, [refreshMemories])
+
+  // 加载技能市场列表
+  useEffect(() => {
+    listSkills()
+      .then((data) => setSkills(data.skills))
+      .catch(() => {})
   }, [])
 
   // 默认模型
@@ -263,6 +343,19 @@ export default function Chat() {
     fileInputRef.current?.click()
   }, [])
 
+  // 删除单条记忆
+  const handleDeleteMemory = useCallback(
+    async (memoryId: string) => {
+      try {
+        await deleteMemory(memoryId, "default")
+        setMemories((prev) => prev.filter((m) => m.id !== memoryId))
+      } catch {
+        // 静默失败
+      }
+    },
+    [],
+  )
+
   // 发送消息
   const handleSend = useCallback(async () => {
     const text = input.trim()
@@ -360,11 +453,70 @@ export default function Chat() {
     const controller = new AbortController()
     abortRef.current = controller
 
+    // ===== GUI Agent：检测用户输入中的 URL，自动浏览网页 =====
+    const urls = extractUrls(text)
+    const wantLatestLaw = isLatestLawSearch(text)
+    if (urls.length > 0) {
+      // 对每个 URL 异步浏览，结果以卡片展示
+      urls.forEach((url) => {
+        setBrowseStatusByMsg((prev) => ({
+          ...prev,
+          [aiMsgId]: `正在浏览网页: ${url}`,
+        }))
+        browseUrl(url, `提取网页内容，辅助回答用户问题：${text}`)
+          .then((result) => {
+            setBrowseResultsByMsg((prev) => ({
+              ...prev,
+              [aiMsgId]: [...(prev[aiMsgId] || []), result],
+            }))
+            setBrowseStatusByMsg((prev) => {
+              const next = { ...prev }
+              delete next[aiMsgId]
+              return next
+            })
+          })
+          .catch(() => {
+            setBrowseStatusByMsg((prev) => {
+              const next = { ...prev }
+              delete next[aiMsgId]
+              return next
+            })
+          })
+      })
+    } else if (wantLatestLaw) {
+      setBrowseStatusByMsg((prev) => ({
+        ...prev,
+        [aiMsgId]: "正在通过 GUI Agent 搜索最新法律信息...",
+      }))
+      browseUrl(
+        "https://flk.npc.gov.cn/",
+        `搜索与用户问题相关的最新法律：${text}`,
+      )
+        .then((result) => {
+          setBrowseResultsByMsg((prev) => ({
+            ...prev,
+            [aiMsgId]: [...(prev[aiMsgId] || []), result],
+          }))
+          setBrowseStatusByMsg((prev) => {
+            const next = { ...prev }
+            delete next[aiMsgId]
+            return next
+          })
+        })
+        .catch(() => {
+          setBrowseStatusByMsg((prev) => {
+            const next = { ...prev }
+            delete next[aiMsgId]
+            return next
+          })
+        })
+    }
+
     // ===== 统一流式回复分支 =====
     // 后端 /api/chat/multi-turn 负责编排：
     //   1. 检测图片生成关键词 → 调用 GLM-Image
     //   2. 检测图片附件 → 调用 GLM-OCR 视觉模型
-    //   3. 正常多轮对话 → chat_stream_with_reasoning
+    //   3. 正常多轮对话 → chat_stream_with_reasoning（含 memory/skill 注入）
     let accumulated = ""
 
     await streamMultiTurn(apiMessages, {
@@ -394,6 +546,16 @@ export default function Chat() {
           [aiMsgId]: [...(prev[aiMsgId] || []), url],
         }))
       },
+      onMemory: () => {
+        // 记忆信息已通过 thinking 步骤展示"已参考 N 条历史记忆"
+        // 此处可选刷新侧边栏记忆列表
+      },
+      onSkill: (info) => {
+        setSkillByMsg((prev) => ({
+          ...prev,
+          [aiMsgId]: { name: info.name, description: info.description },
+        }))
+      },
       onChunk: (chunk) => {
         accumulated += chunk
         updateMessage(convId!, aiMsgId, accumulated)
@@ -401,6 +563,8 @@ export default function Chat() {
       onDone: () => {
         setStreaming(false)
         abortRef.current = null
+        // 对话结束后刷新记忆列表（后端已提取并保存新记忆）
+        refreshMemories()
       },
       onError: (err) => {
         accumulated += `\n\n⚠️ ${err}`
@@ -426,6 +590,7 @@ export default function Chat() {
     setReasoningByMsg,
     setGeneratedImages,
     renameConversation,
+    refreshMemories,
   ])
 
   // 停止生成
@@ -612,6 +777,20 @@ export default function Chat() {
                       </div>
                     ) : (
                       <div className="rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-sm ring-1 ring-gray-100">
+                        {/* 当前使用技能标识 */}
+                        {skillByMsg[msg.id] && (
+                          <div className="mb-2 inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700 ring-1 ring-amber-200">
+                            <Wrench className="h-3 w-3" />
+                            当前使用技能: {skillByMsg[msg.id].name}
+                          </div>
+                        )}
+                        {/* GUI Agent 浏览状态提示 */}
+                        {browseStatusByMsg[msg.id] && (
+                          <div className="mb-2 flex items-center gap-1.5 rounded-lg bg-cyan-50 px-3 py-1.5 text-xs text-cyan-700">
+                            <Globe className="h-3.5 w-3.5 animate-pulse" />
+                            {browseStatusByMsg[msg.id]}
+                          </div>
+                        )}
                         {/* 思考过程折叠面板：steps=编排步骤（离散列表），content=reasoning（流式段落） */}
                         {(thinkingByMsg[msg.id]?.length > 0 ||
                           !!reasoningByMsg[msg.id]) && (
@@ -661,6 +840,64 @@ export default function Chat() {
                                 />
                               </a>
                             ))}
+                          </div>
+                        )}
+                        {/* GUI Agent 浏览结果卡片 */}
+                        {browseResultsByMsg[msg.id]?.length > 0 && (
+                          <div className="mt-3 space-y-2">
+                            {browseResultsByMsg[msg.id].map((br, i) => {
+                              const cardKey = `${msg.id}-${i}`
+                              const isExpanded = expandedBrowseKey === cardKey
+                              return (
+                                <div
+                                  key={cardKey}
+                                  className="overflow-hidden rounded-lg border border-cyan-200 bg-cyan-50/40"
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setExpandedBrowseKey(isExpanded ? null : cardKey)
+                                    }
+                                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-cyan-800 transition hover:bg-cyan-100/40"
+                                  >
+                                    <Globe className="h-3.5 w-3.5 shrink-0" />
+                                    <span className="flex-1 truncate">
+                                      {br.title || br.url}
+                                    </span>
+                                    <a
+                                      href={br.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      onClick={(e) => e.stopPropagation()}
+                                      className="shrink-0 text-cyan-500 hover:text-cyan-700"
+                                      title="在新标签打开"
+                                    >
+                                      <ExternalLink className="h-3.5 w-3.5" />
+                                    </a>
+                                    <ChevronDown
+                                      className={cn(
+                                        "h-3.5 w-3.5 shrink-0 transition-transform",
+                                        isExpanded && "rotate-180",
+                                      )}
+                                    />
+                                  </button>
+                                  {isExpanded ? (
+                                    <div className="border-t border-cyan-200 px-3 py-2 text-xs text-gray-600">
+                                      <p className="mb-1 break-all text-[11px] text-cyan-600">
+                                        {br.url}
+                                      </p>
+                                      <p className="whitespace-pre-wrap break-words">
+                                        {br.summary || br.text_preview?.slice(0, 800) || "无内容摘要"}
+                                      </p>
+                                    </div>
+                                  ) : (
+                                    <p className="px-3 pb-2 text-xs text-gray-500 line-clamp-2">
+                                      {br.summary || br.text_preview?.slice(0, 120) || ""}
+                                    </p>
+                                  )}
+                                </div>
+                              )
+                            })}
                           </div>
                         )}
                         {/* 流式光标 */}
@@ -816,6 +1053,122 @@ export default function Chat() {
               支持 .txt .md .pdf .docx .png .jpg，单文件最大 10MB
             </p>
           </div>
+        </div>
+      </div>
+
+      {/* 右侧侧边栏：我的记忆 + 技能市场 */}
+      <div className="flex w-72 shrink-0 flex-col border-l border-gray-200 bg-white">
+        {/* 我的记忆面板 */}
+        <div className="border-b border-gray-200">
+          <button
+            onClick={() => setMemoryPanelOpen((v) => !v)}
+            className="flex w-full items-center gap-2 px-4 py-3 text-sm font-semibold text-gray-700 transition hover:bg-gray-50"
+          >
+            <Brain className="h-4 w-4 text-purple-500" />
+            <span className="flex-1 text-left">我的记忆</span>
+            <span className="text-xs text-gray-400">{memories.length}</span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 transition-transform",
+                memoryPanelOpen && "rotate-180",
+              )}
+            />
+          </button>
+          {memoryPanelOpen && (
+            <div className="max-h-72 overflow-y-auto px-3 pb-3">
+              {memories.length === 0 ? (
+                <p className="px-1 py-3 text-center text-xs text-gray-400">
+                  暂无记忆，对话后将自动提取
+                </p>
+              ) : (
+                <div className="space-y-1.5">
+                  {memories.map((m) => (
+                    <div
+                      key={m.id}
+                      className="group rounded-lg border border-gray-100 bg-gray-50 px-2.5 py-2"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="rounded bg-purple-100 px-1.5 py-0.5 text-[10px] font-medium text-purple-600">
+                          {m.category}
+                        </span>
+                        <button
+                          onClick={() => handleDeleteMemory(m.id)}
+                          className="shrink-0 text-gray-300 opacity-0 transition hover:text-red-500 group-hover:opacity-100"
+                          title="删除记忆"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                      <p className="mt-1 text-xs leading-relaxed text-gray-600">
+                        {m.content}
+                      </p>
+                      {m.created_at && (
+                        <p className="mt-1 text-[10px] text-gray-300">
+                          {formatMemoryTime(m.created_at)}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* 技能市场面板 */}
+        <div className="flex-1 overflow-hidden">
+          <button
+            onClick={() => setSkillsPanelOpen((v) => !v)}
+            className="flex w-full items-center gap-2 px-4 py-3 text-sm font-semibold text-gray-700 transition hover:bg-gray-50"
+          >
+            <Wrench className="h-4 w-4 text-amber-500" />
+            <span className="flex-1 text-left">技能市场</span>
+            <span className="text-xs text-gray-400">{skills.length}</span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 transition-transform",
+                skillsPanelOpen && "rotate-180",
+              )}
+            />
+          </button>
+          {skillsPanelOpen && (
+            <div className="max-h-[calc(100%-3rem)] overflow-y-auto px-3 pb-3">
+              {skills.length === 0 ? (
+                <p className="px-1 py-3 text-center text-xs text-gray-400">
+                  暂无可用技能
+                </p>
+              ) : (
+                <div className="space-y-1.5">
+                  {skills.map((s) => (
+                    <div
+                      key={s.name}
+                      onClick={() =>
+                        setSelectedSkill(selectedSkill === s.name ? null : s.name)
+                      }
+                      className={cn(
+                        "cursor-pointer rounded-lg border px-2.5 py-2 transition",
+                        selectedSkill === s.name
+                          ? "border-amber-300 bg-amber-50"
+                          : "border-gray-100 bg-gray-50 hover:border-amber-200",
+                      )}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-semibold text-gray-700">
+                          {s.name}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[11px] leading-relaxed text-gray-500">
+                        {s.description}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <p className="mt-2 px-1 text-[10px] text-gray-300">
+                对话时后端将自动匹配最合适的技能
+              </p>
+            </div>
+          )}
         </div>
       </div>
     </div>

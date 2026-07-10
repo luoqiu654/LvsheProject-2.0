@@ -48,6 +48,9 @@ export default function MapView() {
   // 旋转拨盘：bearing 为当前角度（0-360），bearingNonce 变化触发地图组件 useEffect
   const [bearing, setBearing] = useState<number>(0)
   const [bearingNonce, setBearingNonce] = useState<number>(0)
+  // 俯视角度：pitch 为当前角度（0-60），pitchNonce 变化触发地图组件 useEffect
+  const [pitch, setPitch] = useState<number>(45)
+  const [pitchNonce, setPitchNonce] = useState<number>(0)
   // 地图模式：默认高德快速模式（国内 CDN，加载流畅，自带 3D 建筑）
   const [mapMode, setMapMode] = useState<MapMode>('amap')
   // 当前视图快照：模式切换时用于保持中心/缩放
@@ -77,6 +80,14 @@ export default function MapView() {
     const normalized = n < 0 ? n + 360 : n
     setBearing(normalized)
     setBearingNonce((prev) => prev + 1)
+  }, [])
+
+  // 俯视角度滑块：更新 pitch 并递增 nonce 触发地图跟随
+  const handlePitchChange = useCallback((p: number) => {
+    // 限制到 0-60
+    const clamped = Math.max(0, Math.min(60, p))
+    setPitch(clamped)
+    setPitchNonce((prev) => prev + 1)
   }, [])
 
   const handleSelectLocation = useCallback((id: string | null) => {
@@ -157,11 +168,15 @@ export default function MapView() {
                 {...commonMapProps}
                 bearing={bearing}
                 bearingNonce={bearingNonce}
+                pitch={pitch}
+                pitchNonce={pitchNonce}
               />
               <MapRotationDial
                 bearing={bearing}
                 onChange={handleBearingChange}
                 onReset={() => handleBearingChange(0)}
+                pitch={pitch}
+                onPitchChange={handlePitchChange}
               />
             </>
           ) : mapMode === '2d' ? (
@@ -172,11 +187,15 @@ export default function MapView() {
                 {...commonMapProps}
                 bearing={bearing}
                 bearingNonce={bearingNonce}
+                pitch={pitch}
+                pitchNonce={pitchNonce}
               />
               <MapRotationDial
                 bearing={bearing}
                 onChange={handleBearingChange}
                 onReset={() => handleBearingChange(0)}
+                pitch={pitch}
+                onPitchChange={handlePitchChange}
               />
             </>
           )}

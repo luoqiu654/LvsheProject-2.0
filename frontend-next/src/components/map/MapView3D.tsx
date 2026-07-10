@@ -67,6 +67,10 @@ interface MapView3DProps {
   bearing?: number
   /** 当 nonce 变化时，应用 bearing 到地图视角 */
   bearingNonce?: number
+  /** 当前俯视角度 0-60（由外部拨盘控制） */
+  pitch?: number
+  /** 当 nonce 变化时，应用 pitch 到地图视角 */
+  pitchNonce?: number
   /** 初始视图（用于模式切换时保持中心/缩放），仅首次初始化生效 */
   initialView?: { center: [number, number]; zoom: number }
   /** 地图移动结束时回调，用于上报当前视图状态 */
@@ -84,6 +88,8 @@ export default function MapView3D({
   flyTarget,
   bearing,
   bearingNonce,
+  pitch,
+  pitchNonce,
   initialView,
   onViewChange,
 }: MapView3DProps) {
@@ -323,6 +329,30 @@ export default function MapView3D({
     // 仅依赖 nonce 变化触发
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bearingNonce])
+
+  // 外部拨盘触发俯视角度变化（即时跟随，与 bearing 模式一致）
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || pitch === undefined || pitchNonce === undefined) return
+    // 初始 nonce=0 跳过（避免覆盖地图初始 pitch）
+    if (pitchNonce === 0) return
+
+    const applyPitch = () => {
+      try {
+        map.setPitch(pitch as number)
+      } catch (err) {
+        console.warn('[MapView3D] setPitch failed:', err)
+      }
+    }
+
+    if (map.loaded()) {
+      applyPitch()
+    } else {
+      map.once('load', applyPitch)
+    }
+    // 仅依赖 nonce 变化触发
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pitchNonce])
 
   return (
     <>

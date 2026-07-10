@@ -205,6 +205,8 @@ class CourtOrchestrator:
         - thinking: {role, text, round} 模型 reasoning_content（段落）
         - speech: {role, kind, text, round} 发言
         - speech_end: {role, kind, round}
+        - tool_call: {role, tool, input, round} 自主 Agent 工具调用记录
+        - tool_result: {role, tool, output, round} 工具调用结果
         - evidence_list: {items, round}
         - user_question: {question_id, question, context, round}
         - user_answer: {question_id, answer, round}
@@ -264,7 +266,7 @@ class CourtOrchestrator:
                 yield {"type": "round_end", "round": rn}
 
             # 5. 判决 + 打回检查
-            async for ev in self._node_verdict_and_check(state):
+            async for ev in self._node_verdict_and_check(state, answer_callback):
                 yield ev
 
             # 6. 完成
@@ -464,6 +466,25 @@ class CourtOrchestrator:
             "text": f"原告正在准备第 {rn} 轮陈述...",
             "round": rn,
         }
+        # 展示原告调用 law_search 工具检索法律条文（自主 Agent 工具调用记录）
+        yield {
+            "type": "tool_call",
+            "role": ROLE_PLAINTIFF,
+            "tool": "law_search",
+            "input": state.case[:200],
+            "round": rn,
+        }
+        plaintiff_law_context = await self.plaintiff._retrieve_law_context(
+            state.case,
+        )
+        if plaintiff_law_context:
+            yield {
+                "type": "tool_result",
+                "role": ROLE_PLAINTIFF,
+                "tool": "law_search",
+                "output": plaintiff_law_context[:500],
+                "round": rn,
+            }
         context = (
             f"这是第 {rn} 轮辩论。请全面陈述诉讼请求、事实和理由，"
             if rn == 1
@@ -535,6 +556,25 @@ class CourtOrchestrator:
             "text": f"被告正在准备第 {rn} 轮答辩...",
             "round": rn,
         }
+        # 展示被告调用 law_search 工具检索法律条文（自主 Agent 工具调用记录）
+        yield {
+            "type": "tool_call",
+            "role": ROLE_DEFENDANT,
+            "tool": "law_search",
+            "input": state.case[:200],
+            "round": rn,
+        }
+        defendant_law_context = await self.defendant._retrieve_law_context(
+            state.case,
+        )
+        if defendant_law_context:
+            yield {
+                "type": "tool_result",
+                "role": ROLE_DEFENDANT,
+                "tool": "law_search",
+                "output": defendant_law_context[:500],
+                "round": rn,
+            }
         context = (
             "这是第一轮答辩，请针对原告的诉讼请求进行全面抗辩。"
             if rn == 1
@@ -855,13 +895,17 @@ class CourtOrchestrator:
     # ========== 节点：判决 + 打回检查 ==========
 
     async def _node_verdict_and_check(
-        self, state: CourtState,
+        self,
+        state: CourtState,
+        answer_callback: Optional[Callable[..., Any]] = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """生成判决 + 打回检查（含重试循环）。
 
+        - 判决前显式检索法律条文并展示 tool_call/tool_result 事件（自主 Agent 工具调用）
         - judge.render_verdict 生成判决（内部设置 _user_said_unknown）
         - judge.check_rebuttal 检查是否打回
         - 端水 / 无法判断（用户没说"不知道"）→ 打回，retry_count++
+          打回原因为"需继续追问用户"时，先向用户追问关键证据
         - retry_count >= _MAX_VERDICT_RETRIES → 强制接受
         """
         rn = state.rounds_planned + 1
@@ -872,6 +916,23 @@ class CourtOrchestrator:
                 "text": "法官正在综合所有辩论和证据，撰写判决书...",
                 "round": rn,
             }
+            # 法官判决前显式检索法律条文，展示自主 Agent 工具调用记录
+            yield {
+                "type": "tool_call",
+                "role": ROLE_JUDGE,
+                "tool": "law_search",
+                "input": state.case[:200],
+                "round": rn,
+            }
+            law_context = await self.judge._retrieve_law_context(state.case)
+            if law_context:
+                yield {
+                    "type": "tool_result",
+                    "role": ROLE_JUDGE,
+                    "tool": "law_search",
+                    "output": law_context[:500],
+                    "round": rn,
+                }
             history = self._build_history(state)
             try:
                 verdict = await self.judge.render_verdict(
@@ -903,6 +964,41 @@ class CourtOrchestrator:
             if needs_rebuttal and state.retry_count < self._MAX_VERDICT_RETRIES:
                 state.retry_count += 1
                 state.needs_rebuttal = True
+                # 如果打回原因是"需继续追问用户"，先向用户追问关键证据
+                if "追问用户" in reason and answer_callback is not None:
+                    question_id = f"verdict_retry_{state.retry_count}"
+                    question = (
+                        "为了做出公正判决，请您补充关键信息：您是否持有与本案相关的"
+                        "书面证据（如合同、收据、转账记录等）？如有请详细说明。"
+                    )
+                    context = (
+                        "法官在判决前需要您确认关键证据是否持有，以便做出明确判决。"
+                    )
+                    yield {
+                        "type": "user_question",
+                        "question_id": question_id,
+                        "question": question,
+                        "context": context,
+                        "round": rn,
+                    }
+                    answer = await self._call_answer_callback(
+                        answer_callback, question_id, question, context,
+                    )
+                    yield {
+                        "type": "user_answer",
+                        "question_id": question_id,
+                        "answer": answer,
+                        "round": rn,
+                    }
+                    if self._is_user_unknown(answer):
+                        state.user_said_unknown = True
+                    state.user_answers.append({
+                        "question_id": question_id,
+                        "question": question,
+                        "answer": answer,
+                        "content": answer,
+                        "round": rn,
+                    })
                 yield {
                     "type": "thinking_note",
                     "role": ROLE_JUDGE,

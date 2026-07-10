@@ -82,6 +82,8 @@ export type TrialEventType =
   | "thinking_note"     // 编排提示（离散步骤，如"法官正在审查..."）
   | "speech"
   | "speech_end"
+  | "tool_call"         // 自主 Agent 工具调用记录
+  | "tool_result"       // 工具调用结果
   | "user_question"
   | "user_answer"
   | "round_end"
@@ -89,6 +91,20 @@ export type TrialEventType =
   | "evidence_list"     // 法官证据梳理清单
   | "done"
   | "error"
+
+/** 工具调用记录项（自主 Agent plan→tool→final 模式中的 tool 步骤） */
+export interface ToolCallRecord {
+  /** 调用方角色 */
+  role: TrialRole
+  /** 工具名称，如 "law_search" */
+  tool: string
+  /** 工具输入 */
+  input?: string
+  /** 工具输出（tool_result 事件携带） */
+  output?: string
+  /** 轮次 */
+  round: number
+}
 
 /** SSE 流式事件（data: {JSON} 的 JSON 结构） */
 export interface TrialStreamEvent {
@@ -119,6 +135,10 @@ export interface TrialStreamEvent {
   items?: EvidenceItem[]
   // user_question (evidence_name 附加字段)
   evidence_name?: string
+  // tool_call / tool_result（自主 Agent 工具调用）
+  tool?: string
+  input?: string
+  output?: string
 }
 
 /** 庭审请求参数 */
@@ -140,6 +160,10 @@ export interface TrialStreamCallbacks {
   onSpeech?: (role: TrialRole, text: string, kind: SpeechKind, round: number) => void
   /** 某角色的某段发言结束（标记当前发言卡片为完成） */
   onSpeechEnd?: (role: TrialRole, kind: SpeechKind, round: number) => void
+  /** 自主 Agent 工具调用（plan→tool→final 中的 tool 步骤） */
+  onToolCall?: (role: TrialRole, tool: string, input: string, round: number) => void
+  /** 工具调用结果 */
+  onToolResult?: (role: TrialRole, tool: string, output: string, round: number) => void
   /** 法官需要用户补充证据，流暂停，前端弹模态窗 */
   onUserQuestion?: (question: UserQuestion) => void
   /** 用户回答已收到并回传（前端可展示用户回答卡片） */
@@ -306,6 +330,26 @@ function dispatchEvent(
         opts.onSpeechEnd?.(
           event.role,
           (event.kind ?? "statement") as SpeechKind,
+          event.round ?? 0,
+        )
+      }
+      break
+    case "tool_call":
+      if (event.role && event.tool) {
+        opts.onToolCall?.(
+          event.role,
+          event.tool,
+          event.input || "",
+          event.round ?? 0,
+        )
+      }
+      break
+    case "tool_result":
+      if (event.role && event.tool) {
+        opts.onToolResult?.(
+          event.role,
+          event.tool,
+          event.output || "",
           event.round ?? 0,
         )
       }
