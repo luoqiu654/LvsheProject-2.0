@@ -65,7 +65,13 @@ export function ThinkingPanel({
   }, [thinking])
 
   const hasSteps = !!steps && steps.length > 0
-  const hasContentText = !!content && content.length > 0
+  // 防御：content 若为数组（旧数据残留），自动 join("")；非字符串强制转字符串
+  const contentStr = Array.isArray(content)
+    ? content.join("")
+    : content == null
+      ? ""
+      : String(content)
+  const hasContentText = contentStr.length > 0
   const hasChildren = !!children
   const hasContent = hasSteps || hasContentText || hasChildren
   if (!hasContent && !thinking) return null
@@ -147,7 +153,7 @@ export function ThinkingPanel({
             </ol>
           )}
           {hasContentText && (
-            <p className="whitespace-pre-wrap break-words">{content}</p>
+            <p className="whitespace-pre-wrap break-words">{contentStr}</p>
           )}
           {!hasSteps && !hasContentText && hasChildren && children}
         </div>

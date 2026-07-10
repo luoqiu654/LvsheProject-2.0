@@ -616,8 +616,12 @@ export default function Chat() {
                         {(thinkingByMsg[msg.id]?.length > 0 ||
                           !!reasoningByMsg[msg.id]) && (
                           <ThinkingPanel
-                            steps={thinkingByMsg[msg.id]}
-                            content={reasoningByMsg[msg.id]}
+                            steps={
+                              Array.isArray(thinkingByMsg[msg.id])
+                                ? thinkingByMsg[msg.id]
+                                : []
+                            }
+                            content={String(reasoningByMsg[msg.id] || "")}
                             active={
                               isStreaming &&
                               msg.id ===

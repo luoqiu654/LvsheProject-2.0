@@ -1,8 +1,9 @@
 import { useCallback, useMemo, useState, type ReactNode } from 'react'
-import { Map as MapIcon, Layers, Box, Zap, RotateCw } from 'lucide-react'
+import { Map as MapIcon, Layers, Box, Zap } from 'lucide-react'
 import MapView3D from '@/components/map/MapView3D'
 import MapView2D, { type MapViewSnapshot } from '@/components/map/MapView2D'
 import MapViewAmap from '@/components/map/MapViewAmap'
+import MapRotationDial from '@/components/map/MapRotationDial'
 import LocationPanel from '@/components/map/LocationPanel'
 import {
   mapLocations,
@@ -44,10 +45,9 @@ export default function MapView() {
     id: string
     nonce: number
   } | null>(null)
-  // 旋转信号：每次点击"旋转 180°"递增 nonce，触发地图组件 useEffect
-  const [rotateSignal, setRotateSignal] = useState<{ nonce: number }>({
-    nonce: 0,
-  })
+  // 旋转拨盘：bearing 为当前角度（0-360），bearingNonce 变化触发地图组件 useEffect
+  const [bearing, setBearing] = useState<number>(0)
+  const [bearingNonce, setBearingNonce] = useState<number>(0)
   // 地图模式：默认高德快速模式（国内 CDN，加载流畅，自带 3D 建筑）
   const [mapMode, setMapMode] = useState<MapMode>('amap')
   // 当前视图快照：模式切换时用于保持中心/缩放
@@ -70,9 +70,13 @@ export default function MapView() {
     setFlyTarget((prev) => ({ id, nonce: (prev?.nonce ?? 0) + 1 }))
   }, [])
 
-  // 一键 180° 3D 视角旋转（仅 amap / 3d 模式可用）
-  const handleRotate180 = useCallback(() => {
-    setRotateSignal((prev) => ({ nonce: prev.nonce + 1 }))
+  // 拨盘旋转：拖动时实时更新 bearing 并递增 nonce 触发地图跟随
+  const handleBearingChange = useCallback((angle: number) => {
+    // 规范化到 0-360
+    const n = angle % 360
+    const normalized = n < 0 ? n + 360 : n
+    setBearing(normalized)
+    setBearingNonce((prev) => prev + 1)
   }, [])
 
   const handleSelectLocation = useCallback((id: string | null) => {
@@ -129,20 +133,6 @@ export default function MapView() {
             label="3D"
           />
         </div>
-
-        {/* 180° 3D 视角旋转：仅 amap / 3d 模式显示（2D 无 3D 透视，旋转意义不大） */}
-        {(mapMode === 'amap' || mapMode === '3d') && (
-          <button
-            type="button"
-            onClick={handleRotate180}
-            className="flex items-center gap-1.5 rounded-md border border-gray-200 bg-white px-3 py-1 text-xs font-medium text-gray-700 shadow-sm transition hover:bg-gray-50 hover:text-gray-900"
-            aria-label="旋转 180°"
-            title="旋转 180°"
-          >
-            <RotateCw className="h-3.5 w-3.5" />
-            <span>旋转 180°</span>
-          </button>
-        )}
       </header>
 
       {/* 主体：左面板 + 右地图 */}
@@ -162,11 +152,33 @@ export default function MapView() {
         </aside>
         <main className="relative min-w-0 flex-1">
           {mapMode === 'amap' ? (
-            <MapViewAmap {...commonMapProps} rotateSignal={rotateSignal} />
+            <>
+              <MapViewAmap
+                {...commonMapProps}
+                bearing={bearing}
+                bearingNonce={bearingNonce}
+              />
+              <MapRotationDial
+                bearing={bearing}
+                onChange={handleBearingChange}
+                onReset={() => handleBearingChange(0)}
+              />
+            </>
           ) : mapMode === '2d' ? (
             <MapView2D {...commonMapProps} />
           ) : (
-            <MapView3D {...commonMapProps} rotateSignal={rotateSignal} />
+            <>
+              <MapView3D
+                {...commonMapProps}
+                bearing={bearing}
+                bearingNonce={bearingNonce}
+              />
+              <MapRotationDial
+                bearing={bearing}
+                onChange={handleBearingChange}
+                onReset={() => handleBearingChange(0)}
+              />
+            </>
           )}
         </main>
       </div>

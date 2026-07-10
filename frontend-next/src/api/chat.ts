@@ -87,7 +87,7 @@ export async function streamMultiTurn(
         try {
           const obj = JSON.parse(payload)
           if (obj.thinking) opts.onThinking?.(obj.thinking)
-          if (obj.reasoning) opts.onReasoning?.(obj.reasoning)
+          if (obj.reasoning) opts.onReasoning?.(String(obj.reasoning))
           if (obj.text) opts.onChunk(obj.text)
           if (obj.image) opts.onImage?.(obj.image)
           if (obj.error) opts.onError?.(obj.error)

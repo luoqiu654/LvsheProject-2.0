@@ -138,6 +138,10 @@ export default function Expert() {
   >({})
   // 法官证据梳理清单
   const [evidenceList, setEvidenceList] = useState<EvidenceItem[]>([])
+  // 判决打回提示（法官被打回重判时显示，保持 loading 态直到最终 verdict）
+  const [verdictRebuttalMsg, setVerdictRebuttalMsg] = useState<string | null>(
+    null,
+  )
   const [currentlyThinking, setCurrentlyThinking] = useState<TrialRole | null>(
     null,
   )
@@ -197,6 +201,7 @@ export default function Expert() {
     setThinkingContent({})
     setThinkingStepsByRole({})
     setEvidenceList([])
+    setVerdictRebuttalMsg(null)
     setCurrentlyThinking(null)
 
     const controller = new AbortController()
@@ -219,6 +224,14 @@ export default function Expert() {
             ...prev,
             [role]: [...(prev[role] || []), step],
           }))
+          // 判决打回检测：法官被打回重判时，保持 loading 态并显示提示
+          if (
+            role === "judge" &&
+            (step.includes("打回重审") || step.includes("重新撰写"))
+          ) {
+            setVerdictRebuttalMsg(step)
+            setCurrentlyThinking("judge")
+          }
         },
         onSpeech: (role, speechText, kind, round) => {
           // 角色开始发言，思考阶段结束（不清空已积累的思考内容）
@@ -282,12 +295,15 @@ export default function Expert() {
         onVerdict: (v, _round) => {
           setVerdict(v)
           setCurrentlyThinking(null)
+          // 新判决到达，清除打回提示（若此判决仍被打回，下一条 thinking_note 会重新设置）
+          setVerdictRebuttalMsg(null)
         },
         onEvidenceList: (items, _round) => {
           setEvidenceList(items)
         },
         onDone: (result) => {
           setCurrentlyThinking(null)
+          setVerdictRebuttalMsg(null)
           if (result) {
             setTrialResult(result)
             if (result.verdict) {
@@ -297,6 +313,7 @@ export default function Expert() {
         },
         onError: (err) => {
           setCurrentlyThinking(null)
+          setVerdictRebuttalMsg(null)
           setError(err)
         },
       },
@@ -329,6 +346,7 @@ export default function Expert() {
     abortRef.current = null
     setIsRunning(false)
     setCurrentlyThinking(null)
+    setVerdictRebuttalMsg(null)
     // 标记当前未完成的发言为已完成
     setSpeeches((prev) => prev.map((s) => ({ ...s, isComplete: true })))
   }, [])
@@ -347,6 +365,7 @@ export default function Expert() {
     setThinkingContent({})
     setThinkingStepsByRole({})
     setEvidenceList([])
+    setVerdictRebuttalMsg(null)
     setCurrentlyThinking(null)
   }, [isRunning, handleStop])
 
@@ -363,50 +382,47 @@ export default function Expert() {
       lines.push(`**庭审ID**: ${result.trial_id}`)
       lines.push(`**创建时间**: ${result.created_at}`)
       lines.push(`**案件**: ${result.case}`)
-      lines.push(`**总结**: ${result.summary}`)
       lines.push("")
       lines.push("---")
       lines.push("")
-      lines.push("## 审判长开场白")
-      lines.push("")
-      lines.push(result.opening)
-      lines.push("")
 
-      for (const r of result.rounds) {
+      // 过滤掉判决类发言（判决在末尾单独导出）
+      const nonVerdictSpeeches = result.speeches.filter(
+        (s) => s.kind !== "verdict",
+      )
+
+      // 审判长开场白（从 speeches 中筛 kind==="opening"）
+      const openingSpeeches = nonVerdictSpeeches.filter(
+        (s) => s.kind === "opening",
+      )
+      if (openingSpeeches.length > 0) {
+        lines.push("## 审判长开场白")
+        lines.push("")
+        for (const s of openingSpeeches) {
+          lines.push(s.text)
+          lines.push("")
+        }
+      }
+
+      // 按轮次分组输出辩论发言（rounds 是轮数计数）
+      const totalRounds = result.rounds
+      for (let n = 1; n <= totalRounds; n++) {
+        const roundSpeeches = nonVerdictSpeeches.filter(
+          (s) => s.round === n && s.kind !== "opening",
+        )
+        if (roundSpeeches.length === 0) continue
         lines.push("---")
         lines.push("")
-        lines.push(`## 第 ${r.round_number} 轮辩论`)
+        lines.push(`## 第 ${n} 轮辩论`)
         lines.push("")
-        lines.push("### 原告")
-        lines.push("")
-        lines.push(r.plaintiff_speech)
-        lines.push("")
-        lines.push("### 被告")
-        lines.push("")
-        lines.push(r.defendant_speech)
-        lines.push("")
-        if (r.judge_inquiry) {
-          lines.push("### 法官追问")
+        for (const sp of roundSpeeches) {
+          const roleLabel = ROLE_INFO[sp.role]?.label ?? sp.role
+          const kindLabel = KIND_LABEL[sp.kind as SpeechKind]
+          lines.push(
+            `### ${roleLabel}${kindLabel && kindLabel !== "陈述" ? ` · ${kindLabel}` : ""}`,
+          )
           lines.push("")
-          lines.push(r.judge_inquiry)
-          lines.push("")
-        }
-        if (r.plaintiff_answer) {
-          lines.push("### 原告回答法官")
-          lines.push("")
-          lines.push(r.plaintiff_answer)
-          lines.push("")
-        }
-        if (r.defendant_answer) {
-          lines.push("### 被告回答法官")
-          lines.push("")
-          lines.push(r.defendant_answer)
-          lines.push("")
-        }
-        if (r.user_answer) {
-          lines.push("### 用户（当事人）补充证据")
-          lines.push("")
-          lines.push(r.user_answer)
+          lines.push(sp.text)
           lines.push("")
         }
       }
@@ -418,21 +434,14 @@ export default function Expert() {
       lines.push("## 最终判决")
       lines.push("")
       lines.push(`**胜诉方**: ${v.winner}`)
-      lines.push(`**原告胜诉概率**: ${v.plaintiff_win_rate.toFixed(0)}%`)
-      lines.push(`**被告胜诉概率**: ${v.defendant_win_rate.toFixed(0)}%`)
       lines.push("")
-      lines.push("### 关键胜负点")
-      for (const p of v.key_points) {
-        lines.push(`- ${p}`)
+      if (v.compensation) {
+        lines.push("### 赔偿 / 责任承担")
+        lines.push(v.compensation)
+        lines.push("")
       }
-      lines.push("")
       lines.push("### 判决理由")
       lines.push(v.reasoning)
-      lines.push("")
-      lines.push("### 行动建议")
-      for (const s of v.action_suggestions) {
-        lines.push(`- ${s}`)
-      }
       lines.push("")
       lines.push("### 判决书全文")
       lines.push("")
@@ -688,7 +697,7 @@ export default function Expert() {
             {isRunning && !pendingQuestion && (
               <div className="flex items-center justify-center gap-2 py-4 text-sm text-gray-500">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                庭审进行中...
+                {verdictRebuttalMsg ?? "庭审进行中..."}
               </div>
             )}
 
@@ -887,41 +896,15 @@ function VerdictPanel({ verdict }: VerdictPanelProps) {
         </span>
       </div>
 
-      {/* 胜率条 */}
-      <div className="mb-4">
-        <div className="mb-1 flex items-center justify-between text-xs text-gray-500">
-          <span>原告 {verdict.plaintiff_win_rate.toFixed(0)}%</span>
-          <span>被告 {verdict.defendant_win_rate.toFixed(0)}%</span>
-        </div>
-        <div className="flex h-3 overflow-hidden rounded-full bg-gray-200">
-          <div
-            className="bg-blue-500 transition-all duration-500"
-            style={{ width: `${verdict.plaintiff_win_rate}%` }}
-          />
-          <div
-            className="bg-red-500 transition-all duration-500"
-            style={{ width: `${verdict.defendant_win_rate}%` }}
-          />
-        </div>
-      </div>
-
-      {/* 关键胜负点 */}
-      {verdict.key_points.length > 0 && (
+      {/* 赔偿/责任承担说明 */}
+      {verdict.compensation && (
         <div className="mb-4">
           <h3 className="mb-2 text-sm font-semibold text-gray-700">
-            关键胜负点
+            赔偿 / 责任承担
           </h3>
-          <ul className="space-y-1">
-            {verdict.key_points.map((point, i) => (
-              <li
-                key={i}
-                className="flex items-start gap-2 text-sm text-gray-600"
-              >
-                <span className="mt-1 text-amber-500">•</span>
-                {point}
-              </li>
-            ))}
-          </ul>
+          <div className="rounded-lg bg-white/60 p-3 text-sm text-gray-700">
+            {verdict.compensation}
+          </div>
         </div>
       )}
 
@@ -932,26 +915,6 @@ function VerdictPanel({ verdict }: VerdictPanelProps) {
           <div className="rounded-lg bg-white/60 p-3 text-sm text-gray-700">
             {verdict.reasoning}
           </div>
-        </div>
-      )}
-
-      {/* 行动建议 */}
-      {verdict.action_suggestions.length > 0 && (
-        <div className="mb-4">
-          <h3 className="mb-2 text-sm font-semibold text-gray-700">
-            行动建议
-          </h3>
-          <ul className="space-y-1">
-            {verdict.action_suggestions.map((s, i) => (
-              <li
-                key={i}
-                className="flex items-start gap-2 text-sm text-gray-600"
-              >
-                <span className="mt-1 text-green-500">✓</span>
-                {s}
-              </li>
-            ))}
-          </ul>
         </div>
       )}
 

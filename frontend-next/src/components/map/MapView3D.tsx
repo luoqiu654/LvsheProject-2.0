@@ -63,8 +63,10 @@ interface MapView3DProps {
   onSelectLocation: (id: string | null) => void
   /** 当 nonce 变化时，飞行到 id 对应地点 */
   flyTarget: { id: string; nonce: number } | null
-  /** 当 nonce 变化时，绕当前视角旋转 180°（保持 3D 透视） */
-  rotateSignal?: { nonce: number }
+  /** 当前目标方位角 0-360（由外部拨盘控制） */
+  bearing?: number
+  /** 当 nonce 变化时，应用 bearing 到地图视角 */
+  bearingNonce?: number
   /** 初始视图（用于模式切换时保持中心/缩放），仅首次初始化生效 */
   initialView?: { center: [number, number]; zoom: number }
   /** 地图移动结束时回调，用于上报当前视图状态 */
@@ -80,7 +82,8 @@ export default function MapView3D({
   selectedLocationId,
   onSelectLocation,
   flyTarget,
-  rotateSignal,
+  bearing,
+  bearingNonce,
   initialView,
   onViewChange,
 }: MapView3DProps) {
@@ -296,32 +299,30 @@ export default function MapView3D({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flyTarget?.nonce])
 
-  // 外部触发 180° 3D 视角旋转（保持 3D 透视）
+  // 外部拨盘触发视角旋转（即时跟随，无动画过渡以贴合拖动手感）
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !rotateSignal) return
-    // 初始 nonce=0 跳过（首次渲染）
-    if (rotateSignal.nonce === 0) return
+    if (!map || bearing === undefined || bearingNonce === undefined) return
+    // 初始 nonce=0 跳过（首次渲染，避免覆盖地图初始 bearing）
+    if (bearingNonce === 0) return
 
-    const rotate = () => {
-      const nextBearing = (map.getBearing() + 180) % 360
-      map.rotateTo(nextBearing, { duration: 800 })
-      // 保持 3D 透视（pitch 上限 70，避免过度俯仰）
-      map.flyTo({
-        pitch: Math.min(map.getPitch(), 70),
-        duration: 800,
-        essential: true,
-      })
+    const applyBearing = () => {
+      try {
+        // maplibre setBearing(bearing) 为即时设置（无动画），贴合拖动手感
+        map.setBearing(bearing as number)
+      } catch (err) {
+        console.warn('[MapView3D] setBearing failed:', err)
+      }
     }
 
     if (map.loaded()) {
-      rotate()
+      applyBearing()
     } else {
-      map.once('load', rotate)
+      map.once('load', applyBearing)
     }
     // 仅依赖 nonce 变化触发
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rotateSignal?.nonce])
+  }, [bearingNonce])
 
   return (
     <>

@@ -100,6 +100,10 @@ USER_UNKNOWN_PATTERNS = (
     "不知道", "不清楚", "无法确认", "记不清", "不记得", "无从得知", "确实没有",
 )
 
+from backend.core.rag import LegalRAG, rag as default_rag
+from backend.core.skills import SkillRegistry, registry as default_skill_registry
+from backend.core.court_orchestrator import CourtOrchestrator
+
 
 # ========== 新版数据结构 ==========
 
@@ -293,8 +297,15 @@ class CourtSimulator:
     审判长开场 → 原告陈述 → 被告答辩 → [多轮辩论(法官自主追问)] → 法官最终判决
     """
 
-    def __init__(self, llm_gateway: Optional[LLMGateway] = None) -> None:
+    def __init__(
+        self,
+        llm_gateway: Optional[LLMGateway] = None,
+        rag: Optional[LegalRAG] = None,
+        skill_registry: Optional[SkillRegistry] = None,
+    ) -> None:
         self.gateway = llm_gateway or default_gateway
+        self.rag = rag or default_rag
+        self.skill_registry = skill_registry or default_skill_registry
 
     # ========== 工具方法 ==========
 
@@ -1135,6 +1146,8 @@ class CourtSimulator:
         trial_id: Optional[str] = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """
+        @deprecated 使用 CourtOrchestrator.stream_trial 替代。
+
         运行完整庭审（交互式流式）。
 
         流程：
@@ -1165,6 +1178,19 @@ class CourtSimulator:
             {"type":"done","trial_id":"...","result":{...}}
             {"type":"error","message":"..."}
         """
+        orchestrator = CourtOrchestrator(
+            gateway=self.gateway,
+            rag=self.rag,
+            skill_registry=self.skill_registry,
+        )
+        async for event in orchestrator.stream_trial(
+            case=case_description,
+            rounds=rounds,
+            answer_callback=answer_callback,
+        ):
+            yield event
+        return  # 以下旧实现已废弃（@deprecated），保留供参考
+
         rounds = max(1, min(rounds, 5))
         trial_id = trial_id or self._new_trial_id()
         now = self._now()

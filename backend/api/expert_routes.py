@@ -30,6 +30,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.core.multi_agents import court_simulator
+from backend.core.court_orchestrator import CourtOrchestrator
+from backend.core.llm_gateway import gateway as default_gateway
+from backend.core.rag import rag as default_rag
+from backend.core.skills import registry as default_skill_registry
 
 
 router = APIRouter(prefix="/api/expert", tags=["专家会诊"])
@@ -40,6 +44,13 @@ _trial_store: dict[str, dict[str, Any]] = {}
 # 交互式庭审运行态：trial_id -> {"queue": asyncio.Queue, "status": str}
 # status: "running" / "waiting_answer" / "done"
 _trials: dict[str, dict[str, Any]] = {}
+
+# CourtOrchestrator 实例（v3.3 专家会诊重构，注入 gateway/rag/skill_registry 单例）
+court_orchestrator = CourtOrchestrator(
+    gateway=default_gateway,
+    rag=default_rag,
+    skill_registry=default_skill_registry,
+)
 
 
 # ========== 请求 / 响应模型 ==========
@@ -163,11 +174,10 @@ async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
 
     async def generate():
         try:
-            async for event in court_simulator.stream_trial_interactive(
-                case_description=request.case_description,
+            async for event in court_orchestrator.stream_trial(
+                case=request.case_description,
                 rounds=request.rounds,
                 answer_callback=answer_callback,
-                trial_id=trial_id,
             ):
                 # 在转发 user_question 事件前，先设置状态为 waiting_answer
                 # （消除竞态窗口：用户在状态切换前提交回答会被 /answer 拒绝）

@@ -1,6 +1,15 @@
-# LvsheProject 3.2 - 法律 AI Agent 系统
+# LvsheProject 3.3 - 法律 AI Agent 系统
 
 > 红岩网校 Agent 方向考核项目 | 基于 FastAPI + React 18 的全栈法律 AI 智能体系统
+
+## 项目亮点
+
+- **自主多智能体架构**：参考 Agno / CAMEL / CrewAI / elizaOS 等主流多智能体框架理念，以 LangGraph 编排「1 主 agent + 3 子 agent」真实法庭全流程（开庭→证据梳理→用户追问→多轮辩论→判决→打回检查）
+- **真实法庭模拟**：法官主动梳理关键证据清单 → 向用户针对性追问（证据是否真实存在、时间线是否清晰）→ 多轮辩论 → 端水/无理由判决自动打回重判，拒绝和稀泥
+- **RAG 法律依据检索**：每个子 agent 均集成 RAG 检索，从项目蒸馏的法律文件中查找判决依据，让 AI 判决"言之有据"
+- **三模地图 + 360° 旋转**：高德 / OpenFreeMap / MapTiler 三引擎自由切换，圆形拨盘控件支持 0-360° 任意角度拖动旋转
+- **视觉 AI 流水线**：GLM-OCR → GLM 文本 → GLM-Image 端到端合同诊疗
+- **纯 CSS 首页动效**：粒子 + 流光 + 3D 倾斜 + 数字滚动，零新依赖，尊重 `prefers-reduced-motion`
 
 ## 系统架构
 
@@ -124,7 +133,9 @@ LvsheProject/
 │   │   ├── llm_gateway.py     # LLM 统一网关
 │   │   ├── rag.py             # RAG 引擎
 │   │   ├── agents.py          # LangGraph Agent
-│   │   ├── multi_agents.py    # 法庭模拟器
+│   │   ├── multi_agents.py    # 法庭模拟器（旧）
+│   │   ├── court_agents.py    # 法庭子 agent（法官/原告/被告 + RAG）
+│   │   ├── court_orchestrator.py # 法庭主编排器（LangGraph 全流程）
 │   │   ├── contract_pipeline.py # 合同诊疗流水线
 │   │   ├── contract_annotator.py # 合同批注器
 │   │   └── ...
@@ -144,6 +155,19 @@ LvsheProject/
 ```
 
 ## 版本历史
+- **v3.3** - 专家会诊多 agent 重构 + 地图 360° 旋转 + 首页动效 + chat 加固
+  - 专家会诊大重构：1 主 agent + 3 子 agent（法官 / 原告 / 被告）架构
+    - 新建 `court_agents.py`：CourtSubAgent 基类 + PlaintiffAgent / DefendantAgent / JudgeAgent，集成 RAG 检索（从项目蒸馏的法律文件找依据）+ skill 调用
+    - 新建 `court_orchestrator.py`：CourtOrchestrator LangGraph 主编排器，真实法庭全流程（开庭→证据梳理→用户追问→多轮辩论→判决→打回检查）
+    - 法官主动梳理关键证据清单 → 向用户针对性追问（证据是否真实存在、时间线是否清晰）→ 用户回答"不知道"才能以案件不详无法判决
+    - 修复"LLM 服务不可用"误导文案：区分 LLM 真正失败 vs JSON 解析失败，后者从自由文本提取判决
+    - 法官判决打回机制：端水 / 无理由无法判断时主 agent 打回重判（retry<2）
+    - 修复 `user_question` 竞态：状态前置 + 5s 容错 + 300s 超时
+    - 单轮异常容错不中断整体流程
+    - 参考 Agno / CAMEL / CrewAI / elizaOS 多智能体框架理念
+  - chat：思考过程竖排修复，`reasoning_content` 防御性加固（String 转换、Array.isArray 校验、数组自动 join）
+  - 地图：新增 360° 可拖动旋转拨盘控件（MapRotationDial），pointer 事件拖动 0-360° 任意角度，实时同步 maplibre setBearing / 高德 setRotation，触屏兼容，rAF 节流
+  - 首页：浮动粒子 + 渐变流光 + 卡片入场（IntersectionObserver）+ 数字滚动（requestAnimationFrame）+ hover 3D 倾斜 + 按钮流光扫过，纯 CSS 无新依赖，支持 prefers-reduced-motion
 - **v3.2** - 思考过程显示优化 + 文件视觉兜底 + 专家会诊流程优化 + 地图180°旋转
   - chat：修复思考过程竖排异常，reasoning_content 改走 content 段落横向流式显示，编排步骤仍为离散列表
   - chat：PDF/Word 解析为空时自动调用 GLM-OCR 视觉模型兜底，统一文件识别逻辑
