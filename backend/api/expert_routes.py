@@ -162,14 +162,16 @@ async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
 
         状态已在 generate() 转发 user_question 事件前设置为 "waiting_answer"，
         此处仅阻塞等待用户回答，并增加 5 分钟超时保护避免永久阻塞。
+
+        v3.6 修复：移除 finally 中的 _set_trial_status(trial_id, "running")，
+        改为在 generate() 收到 user_answer 事件后再切换状态，消除双击提交时
+        的竞态窗口（finally 立即设 running 导致第二次提交被 409 拒绝）。
         """
         try:
             # 超时保护：5 分钟无回答自动回退
             answer = await asyncio.wait_for(answer_queue.get(), timeout=300)
         except asyncio.TimeoutError:
             return "（用户未在规定时间内回答）"
-        finally:
-            _set_trial_status(trial_id, "running")
         return answer
 
     async def generate():
@@ -186,6 +188,11 @@ async def start_trial_stream(request: TrialRequest) -> StreamingResponse:
                     state = _trials.get(trial_id)
                     if state is not None:
                         state["user_question_at"] = time.monotonic()
+                # v3.6 修复：收到 user_answer 事件后将状态切回 running
+                # （原 answer_callback 的 finally 块立即设 running 导致竞态，
+                #   现统一在 generate() 事件流转中管理状态切换）
+                if event.get("type") == "user_answer":
+                    _set_trial_status(trial_id, "running")
                 # 持久化 done 事件的结果
                 if event.get("type") == "done":
                     result = event.get("result")

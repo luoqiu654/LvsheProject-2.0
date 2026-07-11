@@ -131,13 +131,25 @@ class CourtSubAgent:
                 yield ("content", f"（{self.role_label}暂无回应，LLM 调用失败）")
                 has_yielded_content = True
 
-        # 关键修复：若流式过程中未 yield 任何 content，立即将 reasoning 分段 yield 为
-        # content（每段 50 字），模拟流式效果。旧逻辑在流式结束后一次性 yield 整段
-        # reasoning，导致流式过程中发言区域始终为空显示"等待发言"。
-        if not has_yielded_content and reasoning_acc:
-            chunk_size = 50
-            for i in range(0, len(reasoning_acc), chunk_size):
-                yield ("content", reasoning_acc[i : i + chunk_size])
+        # 关键修复（v3.6）：若流式过程中未 yield 任何 content（如 GLM-4.7-Flash 将
+        # 内容放在 reasoning_content），不再用 reasoning 充当 content（会导致提示词
+        # 泄露到发言区），改为用非流式接口重新调用 LLM，强制输出到 content 字段。
+        if not has_yielded_content:
+            try:
+                retry_resp = await self.gateway.chat(
+                    messages=messages,
+                    model=MODEL_SPEECH,
+                    temperature=0.5,
+                    max_tokens=800,
+                )
+                retry_text = self.gateway.extract_text(retry_resp)
+                if retry_text:
+                    yield ("content", retry_text)
+                    has_yielded_content = True
+            except LLMGatewayError:
+                pass
+            if not has_yielded_content:
+                yield ("content", f"（{self.role_label}暂无回应，请稍后重试）")
 
     async def answer_question(
         self,
@@ -172,12 +184,24 @@ class CourtSubAgent:
                 yield ("content", f"（{self.role_label}暂无回应，LLM 调用失败）")
                 has_yielded_content = True
 
-        # 关键修复：若流式过程中未 yield 任何 content，立即将 reasoning 分段 yield 为
-        # content（每段 50 字），模拟流式效果（与 speak() 一致）。
-        if not has_yielded_content and reasoning_acc:
-            chunk_size = 50
-            for i in range(0, len(reasoning_acc), chunk_size):
-                yield ("content", reasoning_acc[i : i + chunk_size])
+        # 关键修复（v3.6）：与 speak() 一致，不再用 reasoning 充当 content，
+        # 改为非流式接口重新调用 LLM 强制输出到 content 字段。
+        if not has_yielded_content:
+            try:
+                retry_resp = await self.gateway.chat(
+                    messages=messages,
+                    model=MODEL_SPEECH,
+                    temperature=0.6,
+                    max_tokens=600,
+                )
+                retry_text = self.gateway.extract_text(retry_resp)
+                if retry_text:
+                    yield ("content", retry_text)
+                    has_yielded_content = True
+            except LLMGatewayError:
+                pass
+            if not has_yielded_content:
+                yield ("content", f"（{self.role_label}暂无回应，请稍后重试）")
 
     # ---------- RAG 检索 ----------
 

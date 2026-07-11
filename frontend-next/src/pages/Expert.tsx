@@ -332,6 +332,9 @@ export default function Expert() {
         onDone: (result) => {
           setCurrentlyThinking(null)
           setVerdictRebuttalMsg(null)
+          // SSE 流结束（含中断）时清理模态窗状态，避免卡死
+          setPendingQuestion(null)
+          setSubmittingAnswer(false)
           if (result) {
             setTrialResult(result)
             if (result.verdict) {
@@ -342,6 +345,9 @@ export default function Expert() {
         onError: (err) => {
           setCurrentlyThinking(null)
           setVerdictRebuttalMsg(null)
+          // SSE 流出错时清理模态窗状态，避免卡死
+          setPendingQuestion(null)
+          setSubmittingAnswer(false)
           setError(err)
         },
       },
@@ -351,18 +357,32 @@ export default function Expert() {
     abortRef.current = null
   }, [caseInput, isRunning, rounds, findCurrentSpeech])
 
-  // 提交用户对法官追问的回答
+  // 提交用户对法官追问的回答（含重试 + 失败强制关闭模态窗，避免卡死）
   const handleSubmitAnswer = useCallback(async () => {
     if (!trialId || !pendingQuestion) return
     const answer = answerInput.trim()
     if (!answer) return
     setSubmittingAnswer(true)
     try {
-      await submitAnswer(trialId, pendingQuestion.question_id, answer)
-      setPendingQuestion(null)
-      setAnswerInput("")
+      // 重试 3 次，每次间隔 500ms（容忍后端 status 竞态切换）
+      let lastErr: unknown = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await submitAnswer(trialId, pendingQuestion.question_id, answer)
+          setPendingQuestion(null)
+          setAnswerInput("")
+          return
+        } catch (e) {
+          lastErr = e
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 500))
+        }
+      }
+      throw lastErr
     } catch (e) {
       setError(e instanceof Error ? e.message : "提交回答失败")
+      // 关键：失败后仍关闭模态窗，避免永久卡死（用户可重新启动庭审）
+      setPendingQuestion(null)
+      setAnswerInput("")
     } finally {
       setSubmittingAnswer(false)
     }
