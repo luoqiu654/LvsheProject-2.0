@@ -98,6 +98,17 @@ function formatMemoryTime(iso?: string): string {
   }
 }
 
+// AI 消息的附加元数据（思考步骤、推理、技能、浏览结果等），按消息/附件 ID 聚合
+interface MessageMeta {
+  thinking?: string[]
+  reasoning?: string
+  skill?: { name: string; description: string }
+  browseResults?: BrowseResult[]
+  browseStatus?: string
+  visionAnalysis?: string
+  generatedImages?: string[]
+}
+
 export default function Chat() {
   const {
     conversations,
@@ -121,34 +132,9 @@ export default function Chat() {
   const [pendingAttachments, setPendingAttachments] = useState<
     PendingAttachment[]
   >([])
-  // 附件 ID -> 视觉分析描述（用于在用户消息下展示"AI视觉分析"卡片）
-  const [visionAnalysis, setVisionAnalysis] = useState<Record<string, string>>(
-    {},
-  )
-  // AI 消息 ID -> 思考步骤列表（编排步骤，离散列表展示）
-  const [thinkingByMsg, setThinkingByMsg] = useState<Record<string, string[]>>(
-    {},
-  )
-  // AI 消息 ID -> LLM reasoning_content（模型思考过程，字符串累加，横向流式段落）
-  const [reasoningByMsg, setReasoningByMsg] = useState<Record<string, string>>(
-    {},
-  )
-  // AI 消息 ID -> 生成的图片 URL 列表（GLM-Image 生成结果）
-  const [generatedImages, setGeneratedImages] = useState<
-    Record<string, string[]>
-  >({})
-  // AI 消息 ID -> 当前匹配的技能 {name, description}
-  const [skillByMsg, setSkillByMsg] = useState<
-    Record<string, { name: string; description: string }>
-  >({})
-  // AI 消息 ID -> 浏览结果列表（GUI Agent）
-  const [browseResultsByMsg, setBrowseResultsByMsg] = useState<
-    Record<string, BrowseResult[]>
-  >({})
-  // AI 消息 ID -> 浏览状态提示（如"正在浏览网页: XXX"）
-  const [browseStatusByMsg, setBrowseStatusByMsg] = useState<
-    Record<string, string>
-  >({})
+  // 消息/附件 ID -> 附加元数据（思考步骤、推理、技能、浏览结果、视觉分析、生成图片）
+  // 合并自原先 7 个 Record<id, ...> 状态，减少 useState 数量
+  const [msgMeta, setMsgMeta] = useState<Record<string, MessageMeta>>({})
   // 展开的浏览卡片索引（"msgId-index" 形式），null 表示折叠
   const [expandedBrowseKey, setExpandedBrowseKey] = useState<string | null>(
     null,
@@ -230,6 +216,26 @@ export default function Chat() {
     [],
   )
 
+  // 按 ID 局部更新消息元数据（合并 patch 到对应条目）
+  const updateMsgMeta = useCallback(
+    (msgId: string, patch: Partial<MessageMeta>) => {
+      setMsgMeta((prev) => ({
+        ...prev,
+        [msgId]: { ...prev[msgId], ...patch },
+      }))
+    },
+    [],
+  )
+
+  // 按 ID 移除消息元数据（用于删除消息/对话时清理）
+  const removeMsgMeta = useCallback((msgId: string) => {
+    setMsgMeta((prev) => {
+      const next = { ...prev }
+      delete next[msgId]
+      return next
+    })
+  }, [])
+
   // 处理单个文件：文本直读、图片转 base64 后调视觉接口、PDF/DOCX 调解析接口
   const processFile = useCallback(
     async (file: File, id: string) => {
@@ -262,7 +268,7 @@ export default function Chat() {
               visionDescription: desc,
             })
             if (desc) {
-              setVisionAnalysis((prev) => ({ ...prev, [id]: desc }))
+              updateMsgMeta(id, { visionAnalysis: desc })
             }
           } catch {
             // 视觉接口不可用时仍允许发送（无分析卡片）
@@ -302,7 +308,7 @@ export default function Chat() {
         })
       }
     },
-    [updatePending],
+    [updatePending, updateMsgMeta],
   )
 
   // 选择文件
@@ -459,56 +465,49 @@ export default function Chat() {
     if (urls.length > 0) {
       // 对每个 URL 异步浏览，结果以卡片展示
       urls.forEach((url) => {
-        setBrowseStatusByMsg((prev) => ({
-          ...prev,
-          [aiMsgId]: `正在浏览网页: ${url}`,
-        }))
+        updateMsgMeta(aiMsgId, { browseStatus: `正在浏览网页: ${url}` })
         browseUrl(url, `提取网页内容，辅助回答用户问题：${text}`)
           .then((result) => {
-            setBrowseResultsByMsg((prev) => ({
+            // 追加浏览结果并清空浏览状态（等价于原 setBrowseResultsByMsg 追加 + setBrowseStatusByMsg 删除）
+            setMsgMeta((prev) => ({
               ...prev,
-              [aiMsgId]: [...(prev[aiMsgId] || []), result],
+              [aiMsgId]: {
+                ...prev[aiMsgId],
+                browseResults: [
+                  ...(prev[aiMsgId]?.browseResults || []),
+                  result,
+                ],
+                browseStatus: undefined,
+              },
             }))
-            setBrowseStatusByMsg((prev) => {
-              const next = { ...prev }
-              delete next[aiMsgId]
-              return next
-            })
           })
           .catch(() => {
-            setBrowseStatusByMsg((prev) => {
-              const next = { ...prev }
-              delete next[aiMsgId]
-              return next
-            })
+            updateMsgMeta(aiMsgId, { browseStatus: undefined })
           })
       })
     } else if (wantLatestLaw) {
-      setBrowseStatusByMsg((prev) => ({
-        ...prev,
-        [aiMsgId]: "正在通过 GUI Agent 搜索最新法律信息...",
-      }))
+      updateMsgMeta(aiMsgId, {
+        browseStatus: "正在通过 GUI Agent 搜索最新法律信息...",
+      })
       browseUrl(
         "https://flk.npc.gov.cn/",
         `搜索与用户问题相关的最新法律：${text}`,
       )
         .then((result) => {
-          setBrowseResultsByMsg((prev) => ({
+          setMsgMeta((prev) => ({
             ...prev,
-            [aiMsgId]: [...(prev[aiMsgId] || []), result],
+            [aiMsgId]: {
+              ...prev[aiMsgId],
+              browseResults: [
+                ...(prev[aiMsgId]?.browseResults || []),
+                result,
+              ],
+              browseStatus: undefined,
+            },
           }))
-          setBrowseStatusByMsg((prev) => {
-            const next = { ...prev }
-            delete next[aiMsgId]
-            return next
-          })
         })
         .catch(() => {
-          setBrowseStatusByMsg((prev) => {
-            const next = { ...prev }
-            delete next[aiMsgId]
-            return next
-          })
+          updateMsgMeta(aiMsgId, { browseStatus: undefined })
         })
     }
 
@@ -525,25 +524,34 @@ export default function Chat() {
       max_tokens: 4096,
       signal: controller.signal,
       onThinking: (t) => {
-        setThinkingByMsg((prev) => {
-          const arr = prev[aiMsgId] || []
+        setMsgMeta((prev) => {
+          const arr = prev[aiMsgId]?.thinking || []
           // 避免重复追加相同步骤
           if (arr[arr.length - 1] === t) return prev
-          return { ...prev, [aiMsgId]: [...arr, t] }
+          return {
+            ...prev,
+            [aiMsgId]: { ...prev[aiMsgId], thinking: [...arr, t] },
+          }
         })
       },
       onReasoning: (t) => {
         // reasoning_content 字符串累加（横向流式段落，非离散列表）
-        setReasoningByMsg((prev) => ({
+        setMsgMeta((prev) => ({
           ...prev,
-          [aiMsgId]: (prev[aiMsgId] || "") + t,
+          [aiMsgId]: {
+            ...prev[aiMsgId],
+            reasoning: (prev[aiMsgId]?.reasoning || "") + t,
+          },
         }))
       },
       onImage: (url) => {
         // 后端 GLM-Image 生成的图片 URL
-        setGeneratedImages((prev) => ({
+        setMsgMeta((prev) => ({
           ...prev,
-          [aiMsgId]: [...(prev[aiMsgId] || []), url],
+          [aiMsgId]: {
+            ...prev[aiMsgId],
+            generatedImages: [...(prev[aiMsgId]?.generatedImages || []), url],
+          },
         }))
       },
       onMemory: () => {
@@ -551,10 +559,9 @@ export default function Chat() {
         // 此处可选刷新侧边栏记忆列表
       },
       onSkill: (info) => {
-        setSkillByMsg((prev) => ({
-          ...prev,
-          [aiMsgId]: { name: info.name, description: info.description },
-        }))
+        updateMsgMeta(aiMsgId, {
+          skill: { name: info.name, description: info.description },
+        })
       },
       onChunk: (chunk) => {
         accumulated += chunk
@@ -586,9 +593,8 @@ export default function Chat() {
     updateMessage,
     setStreaming,
     setPendingAttachments,
-    setThinkingByMsg,
-    setReasoningByMsg,
-    setGeneratedImages,
+    setMsgMeta,
+    updateMsgMeta,
     renameConversation,
     refreshMemories,
   ])
@@ -649,6 +655,8 @@ export default function Chat() {
               <button
                 onClick={(e) => {
                   e.stopPropagation()
+                  // 清理被删对话中各消息的元数据，避免孤立条目驻留
+                  conv.messages.forEach((m) => removeMsgMeta(m.id))
                   deleteConversation(conv.id)
                 }}
                 className="opacity-0 transition group-hover:opacity-100"
@@ -756,11 +764,12 @@ export default function Chat() {
                           const steps = (msg.attachments || [])
                             .filter(
                               (att) =>
-                                att.type === "image" && visionAnalysis[att.id],
+                                att.type === "image" &&
+                                !!msgMeta[att.id]?.visionAnalysis,
                             )
                             .map(
                               (att) =>
-                                `📎 ${att.name}：\n${visionAnalysis[att.id]}`,
+                                `📎 ${att.name}：\n${msgMeta[att.id]?.visionAnalysis}`,
                             )
                           if (steps.length === 0) return null
                           return (
@@ -778,29 +787,25 @@ export default function Chat() {
                     ) : (
                       <div className="rounded-2xl rounded-tl-sm bg-white px-4 py-3 shadow-sm ring-1 ring-gray-100">
                         {/* 当前使用技能标识 */}
-                        {skillByMsg[msg.id] && (
+                        {msgMeta[msg.id]?.skill && (
                           <div className="mb-2 inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700 ring-1 ring-amber-200">
                             <Wrench className="h-3 w-3" />
-                            当前使用技能: {skillByMsg[msg.id].name}
+                            当前使用技能: {msgMeta[msg.id]?.skill?.name}
                           </div>
                         )}
                         {/* GUI Agent 浏览状态提示 */}
-                        {browseStatusByMsg[msg.id] && (
+                        {msgMeta[msg.id]?.browseStatus && (
                           <div className="mb-2 flex items-center gap-1.5 rounded-lg bg-cyan-50 px-3 py-1.5 text-xs text-cyan-700">
                             <Globe className="h-3.5 w-3.5 animate-pulse" />
-                            {browseStatusByMsg[msg.id]}
+                            {msgMeta[msg.id]?.browseStatus}
                           </div>
                         )}
                         {/* 思考过程折叠面板：steps=编排步骤（离散列表），content=reasoning（流式段落） */}
-                        {(thinkingByMsg[msg.id]?.length > 0 ||
-                          !!reasoningByMsg[msg.id]) && (
+                        {((msgMeta[msg.id]?.thinking?.length || 0) > 0 ||
+                          !!msgMeta[msg.id]?.reasoning) && (
                           <ThinkingPanel
-                            steps={
-                              Array.isArray(thinkingByMsg[msg.id])
-                                ? thinkingByMsg[msg.id]
-                                : []
-                            }
-                            content={String(reasoningByMsg[msg.id] || "")}
+                            steps={msgMeta[msg.id]?.thinking ?? []}
+                            content={String(msgMeta[msg.id]?.reasoning || "")}
                             active={
                               isStreaming &&
                               msg.id ===
@@ -823,29 +828,32 @@ export default function Chat() {
                           </span>
                         )}
                         {/* GLM-Image 生成的图片 */}
-                        {generatedImages[msg.id]?.length > 0 && (
+                        {(msgMeta[msg.id]?.generatedImages?.length || 0) > 0 && (
                           <div className="mt-3 flex flex-wrap gap-3">
-                            {generatedImages[msg.id].map((url, i) => (
-                              <a
-                                key={i}
-                                href={url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                title="点击查看大图"
-                              >
-                                <img
-                                  src={url}
-                                  alt={`生成图片 ${i + 1}`}
-                                  className="max-w-[16rem] rounded-lg border border-gray-200 object-contain shadow-sm transition hover:opacity-90"
-                                />
-                              </a>
-                            ))}
+                            {(msgMeta[msg.id]?.generatedImages ?? []).map(
+                              (url, i) => (
+                                <a
+                                  key={i}
+                                  href={url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title="点击查看大图"
+                                >
+                                  <img
+                                    src={url}
+                                    alt={`生成图片 ${i + 1}`}
+                                    className="max-w-[16rem] rounded-lg border border-gray-200 object-contain shadow-sm transition hover:opacity-90"
+                                  />
+                                </a>
+                              ),
+                            )}
                           </div>
                         )}
                         {/* GUI Agent 浏览结果卡片 */}
-                        {browseResultsByMsg[msg.id]?.length > 0 && (
+                        {(msgMeta[msg.id]?.browseResults?.length || 0) > 0 && (
                           <div className="mt-3 space-y-2">
-                            {browseResultsByMsg[msg.id].map((br, i) => {
+                            {(msgMeta[msg.id]?.browseResults ?? []).map(
+                              (br, i) => {
                               const cardKey = `${msg.id}-${i}`
                               const isExpanded = expandedBrowseKey === cardKey
                               return (

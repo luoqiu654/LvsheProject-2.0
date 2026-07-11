@@ -8,7 +8,7 @@
    不影响导入）。图结构文档化状态流转：opening → evidence_inquiry → user_evidence_question
    → plaintiff_stmt → defendant_stmt → judge_decision（↔ inquiry_answer）→ verdict → verdict_check。
 3. ``stream_trial`` 用顺序 async 逻辑模拟状态流转（比纯 LangGraph 异步流式 + 用户问答回调更可控），
-   流式 yield SSE 事件 dict，事件类型与现有 ``multi_agents.py`` 一致：
+   流式 yield SSE 事件 dict，事件类型与 ``court_constants.py`` 角色常量一致：
    thinking_note / thinking / speech / speech_end / evidence_list / user_question /
    user_answer / verdict / round_end / done / error。
 4. 法官不端水：``check_rebuttal`` 检测端水 / 无法判断（用户没说"不知道"时）→ 打回重审，
@@ -32,7 +32,7 @@ from backend.core.court_agents import (
     Verdict,
 )
 from backend.core.llm_gateway import LLMGateway, LLMGatewayError
-from backend.core.multi_agents import (
+from backend.core.court_constants import (
     KIND_ANSWER,
     KIND_INQUIRY,
     KIND_OPENING,
@@ -58,7 +58,7 @@ class CourtState:
     case: str
     rounds_planned: int
     current_round: int = 0
-    # 所有发言 [{role, kind, text, round}]（role 与 multi_agents ROLE_* 一致）
+    # 所有发言 [{role, kind, text, round}]（role 与 court_constants ROLE_* 一致）
     speeches: list[dict] = field(default_factory=list)
     # 法官追问历史 [{question, target, round}]
     judge_questions: list[dict] = field(default_factory=list)
@@ -199,7 +199,7 @@ class CourtOrchestrator:
     ) -> AsyncGenerator[dict[str, Any], None]:
         """流式执行庭审，yield SSE 事件 dict。
 
-        事件类型与 ``multi_agents.py`` 的 ``stream_trial_interactive`` 一致：
+        事件类型与 ``debate_adapter.py`` 的旧版接口一致：
         - trial_started: {trial_id}
         - thinking_note: {role, text, round} 编排提示（离散步骤）
         - thinking: {role, text, round} 模型 reasoning_content（段落）

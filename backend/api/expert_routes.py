@@ -29,7 +29,6 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend.core.multi_agents import court_simulator
 from backend.core.court_orchestrator import CourtOrchestrator
 from backend.core.llm_gateway import gateway as default_gateway
 from backend.core.rag import rag as default_rag
@@ -106,7 +105,7 @@ async def expert_health() -> dict[str, Any]:
     """专家会诊健康检查。"""
     return {
         "ok": True,
-        "llm_available": court_simulator.gateway.is_available,
+        "llm_available": default_gateway.is_available,
     }
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict
 import json
+import logging
 import re
 import tempfile
 from pathlib import Path
@@ -62,7 +63,7 @@ from backend.core.contract_annotator import contract_annotator
 from backend.core.gui_agent import gui_agent
 from backend.core.llm_gateway import LLMGatewayError, gateway
 from backend.core.memory import memory_manager
-from backend.core.multi_agents import multi_agent_debate
+from backend.core.debate_adapter import multi_agent_debate
 from backend.core.rag import rag
 from backend.core.safe_commands import CommandType, safe_command_executor
 from backend.core.skills import skill_executor
@@ -70,6 +71,8 @@ from backend.utils.document_parser import DocumentParseError, document_parser
 
 
 router = APIRouter(prefix="/api", tags=["LvsheProject API"])
+
+logger = logging.getLogger(__name__)
 
 # 延迟导入，避免循环导入
 _image_rag = None
@@ -111,7 +114,8 @@ async def status() -> StatusResponse:
     try:
         image_rag = _get_image_rag()
         modules["image_rag"] = settings.image_rag_enabled
-    except Exception:
+    except Exception as exc:
+        logger.warning("图像 RAG 初始化失败: %s", exc, exc_info=True)
         modules["image_rag"] = False
 
     # 检查Graph RAG
@@ -120,7 +124,8 @@ async def status() -> StatusResponse:
         stats = graph_rag.get_stats()
         modules["graph_rag"] = settings.graph_rag_enabled
         modules["graph_rag_connected"] = stats.get("is_connected", False)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Graph RAG 初始化失败: %s", exc, exc_info=True)
         modules["graph_rag"] = False
 
     # 检查文档解析增强
@@ -128,7 +133,8 @@ async def status() -> StatusResponse:
         parser_info = document_parser.get_parser_info()
         modules["unstructured"] = parser_info.get("unstructured_available", False)
         modules["minio"] = parser_info.get("minio_connected", False)
-    except Exception:
+    except Exception as exc:
+        logger.warning("文档解析器初始化失败: %s", exc, exc_info=True)
         modules["unstructured"] = False
         modules["minio"] = False
 
@@ -150,6 +156,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         return ChatResponse(answer=answer)
 
     except LLMGatewayError as exc:
+        logger.warning("聊天 LLM 错误: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -414,8 +421,9 @@ async def document_parse(
                     parser_used = "vision_fallback_glm_ocr"
                 else:
                     parser_used = "fallback_failed"
-            except Exception:
+            except Exception as exc:
                 # 视觉模型不可用或识别失败，返回原空结果（不崩溃）
+                logger.warning("视觉模型 OCR 回退失败: %s", exc, exc_info=True)
                 parser_used = "fallback_failed"
 
         return DocumentParseResponse(
@@ -428,6 +436,7 @@ async def document_parse(
     except DocumentParseError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        logger.error("文档解析失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"解析失败：{exc}") from exc
 
 
@@ -468,6 +477,7 @@ async def document_parse_batch(
             })
             fail_count += 1
         except Exception as exc:
+            logger.error("批量解析文件 %s 失败: %s", file.filename, exc, exc_info=True)
             results.append({
                 "filename": file.filename,
                 "success": False,
@@ -505,6 +515,7 @@ async def chat_stream(request: ChatRequest):
             yield "data: [DONE]\n\n"
 
         except LLMGatewayError as exc:
+            logger.warning("单轮聊天流式 LLM 错误: %s", exc)
             yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -615,6 +626,7 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                     else:
                         yield f"data: {json.dumps({'text': '⚠️ 图片生成未返回结果'}, ensure_ascii=False)}\n\n"
                 except Exception as exc:
+                    logger.warning("图片生成失败: %s", exc, exc_info=True)
                     yield f"data: {json.dumps({'text': f'⚠️ 图片生成失败：{exc}'}, ensure_ascii=False)}\n\n"
                 yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
                 return
@@ -647,6 +659,7 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                             break
                         except Exception as exc:
                             vision_error = exc
+                            logger.warning("视觉分析失败（attempt=%d）: %s", attempt + 1, exc)
                             if attempt < 1:
                                 await asyncio.sleep(0.5)
 
@@ -715,9 +728,9 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                                 raw_messages[0]["content"] = rag_system
                             else:
                                 raw_messages.insert(0, {"role": "system", "content": rag_system})
-                    except Exception:
+                    except Exception as exc:
                         # RAG 检索失败不阻断对话
-                        pass
+                        logger.warning("RAG 检索失败，已跳过: %s", exc, exc_info=True)
                 yield f"data: {json.dumps({'thinking': f'找到 {contexts_count} 条相关法律条文'}, ensure_ascii=False)}\n\n"
 
             # ===== Agent Memory：检索用户长期记忆并注入上下文 =====
@@ -748,8 +761,9 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                             else:
                                 lines.append(f"- {item}")
                         memory_context_text = "\n".join(lines)
-                except Exception:
+                except Exception as exc:
                     # 记忆检索失败不阻断对话
+                    logger.warning("记忆检索失败，已跳过: %s", exc, exc_info=True)
                     memory_context_text = ""
                 yield f"data: {json.dumps({'thinking': f'已参考 {memory_count} 条历史记忆'}, ensure_ascii=False)}\n\n"
                 if memory_items_for_frontend:
@@ -768,9 +782,9 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                         matched_skill_desc = matched_skill.description
                         skill_instructions = matched_skill.instructions or ""
                         yield f"data: {json.dumps({'skill': {'name': matched_skill_name, 'description': matched_skill_desc}}, ensure_ascii=False)}\n\n"
-                except Exception:
+                except Exception as exc:
                     # 技能匹配失败不阻断对话
-                    pass
+                    logger.warning("技能匹配失败，已跳过: %s", exc, exc_info=True)
 
             # 将记忆上下文 + skill 指令注入 system prompt
             if memory_context_text or skill_instructions:
@@ -801,6 +815,26 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                     assistant_full_text += text
                     yield f"data: {json.dumps({'text': text}, ensure_ascii=False)}\n\n"
 
+            # ===== 空 content 保护：GLM-4.7-Flash 可能将所有内容放在 reasoning_content =====
+            if not assistant_full_text.strip():
+                logger.warning(
+                    "流式回复 content 为空（model=%s），尝试非流式重试", request.model,
+                )
+                try:
+                    retry_resp = await gateway.chat(
+                        messages=raw_messages,
+                        model=request.model,
+                        temperature=request.temperature,
+                        max_tokens=request.max_tokens,
+                    )
+                    retry_text = gateway.extract_text(retry_resp)
+                    if retry_text:
+                        assistant_full_text = retry_text
+                        yield f"data: {json.dumps({'text': retry_text}, ensure_ascii=False)}\n\n"
+                except LLMGatewayError as exc:
+                    logger.warning("非流式重试也失败: %s", exc)
+                    yield f"data: {json.dumps({'text': '（AI 暂无回应，请稍后重试）'}, ensure_ascii=False)}\n\n"
+
             # ===== Agent Memory：对话结束后提取并保存长期记忆 =====
             if last_user_msg and assistant_full_text.strip():
                 try:
@@ -809,16 +843,18 @@ async def chat_multi_turn(request: MultiTurnChatRequest):
                         assistant_message=assistant_full_text,
                         user_id="default",
                     )
-                except Exception:
+                except Exception as exc:
                     # 记忆保存失败不影响已生成的回答
-                    pass
+                    logger.warning("记忆保存失败，已跳过: %s", exc, exc_info=True)
 
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
 
         except LLMGatewayError as exc:
+            logger.warning("多轮对话 LLM 错误: %s", exc)
             yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
         except Exception as exc:
+            logger.error("多轮对话服务端错误: %s", exc, exc_info=True)
             yield f"data: {json.dumps({'error': f'服务端错误: {exc}'}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'done': True}, ensure_ascii=False)}\n\n"
 
@@ -871,6 +907,7 @@ async def contract_review(request: ContractReviewRequest) -> ContractReviewRespo
         )
 
     except Exception as exc:
+        logger.error("合同审查失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"合同审查失败：{exc}") from exc
 
 
@@ -941,6 +978,7 @@ async def contract_generate_annotated(
     except HTTPException:
         raise
     except Exception as exc:
+        logger.error("生成标注文件失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"生成标注文件失败：{exc}") from exc
 
 
@@ -969,6 +1007,7 @@ async def contract_list_files(user_id: str = "demo_user") -> ListFilesResponse:
         )
 
     except Exception as exc:
+        logger.error("获取文件列表失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取文件列表失败：{exc}") from exc
 
 
@@ -991,6 +1030,7 @@ async def contract_download(filename: str, user_id: str = "demo_user"):
     except HTTPException:
         raise
     except Exception as exc:
+        logger.error("下载文件失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"下载文件失败：{exc}") from exc
 
 
@@ -1020,6 +1060,7 @@ async def contract_cleanup(request: ConfirmCommandRequest) -> CommandResponse:
         )
 
     except Exception as exc:
+        logger.error("合同文件清理失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"清理失败：{exc}") from exc
 
 
@@ -1118,6 +1159,7 @@ async def image_rag_search(request: ImageSearchRequest) -> ImageSearchResponse:
         )
 
     except Exception as exc:
+        logger.error("图像检索失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图像检索失败：{exc}") from exc
 
 
@@ -1153,6 +1195,7 @@ async def image_rag_analyze(file: UploadFile = File(...)) -> ImageAnalyzeRespons
             Path(tmp_path).unlink(missing_ok=True)
 
     except Exception as exc:
+        logger.error("图像分析失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图像分析失败：{exc}") from exc
 
 
@@ -1187,6 +1230,7 @@ async def image_rag_index(file: UploadFile = File(...), description: str = ""):
             Path(tmp_path).unlink(missing_ok=True)
 
     except Exception as exc:
+        logger.error("图像索引失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图像索引失败：{exc}") from exc
 
 
@@ -1241,6 +1285,7 @@ async def graph_rag_search(request: GraphRAGSearchRequest) -> GraphRAGSearchResp
         )
 
     except Exception as exc:
+        logger.error("图谱检索失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图谱检索失败：{exc}") from exc
 
 
@@ -1291,6 +1336,7 @@ async def graph_rag_ask(request: GraphRAGSearchRequest) -> GraphRAGAnswerRespons
         )
 
     except Exception as exc:
+        logger.error("图谱问答失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图谱问答失败：{exc}") from exc
 
 
@@ -1311,6 +1357,7 @@ async def graph_rag_stats() -> GraphStatsResponse:
         )
 
     except Exception as exc:
+        logger.error("获取图谱统计失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"获取图谱统计失败：{exc}") from exc
 
 
@@ -1335,6 +1382,7 @@ async def graph_rag_index_text(text: str, source: str = "api", use_llm: bool = T
         }
 
     except Exception as exc:
+        logger.error("图谱索引失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图谱索引失败：{exc}") from exc
 
 
@@ -1381,8 +1429,10 @@ async def vision_analyze(request: VisionAnalyzeRequest) -> VisionAnalyzeResponse
         )
 
     except LLMGatewayError as exc:
+        logger.warning("视觉识别 LLM 错误: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
+        logger.error("视觉识别失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"视觉识别失败：{exc}") from exc
 
 
@@ -1410,8 +1460,10 @@ async def vision_analyze_file(
         )
 
     except LLMGatewayError as exc:
+        logger.warning("视觉识别(文件) LLM 错误: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
+        logger.error("视觉识别(文件)失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"视觉识别失败：{exc}") from exc
 
 
@@ -1439,8 +1491,10 @@ async def image_generate(request: ImageGenerateRequest) -> ImageGenerateResponse
         )
 
     except LLMGatewayError as exc:
+        logger.warning("图像生成 LLM 错误: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
+        logger.error("图像生成失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"图像生成失败：{exc}") from exc
 
 
@@ -1486,4 +1540,5 @@ async def llm_health_check(model: str | None = None):
         result = await gateway.health_check(model=model)
         return {"ok": True, **result}
     except LLMGatewayError as exc:
+        logger.warning("LLM 健康检查失败: %s", exc)
         return {"ok": False, "error": str(exc)}

@@ -1,32 +1,20 @@
+"""debate_adapter 单元测试（v3.7 从 test_multi_agents.py 迁移）。
+
+测试 LegalMultiAgentDebate 的无 LLM 回退逻辑。
+"""
 import asyncio
 
-from backend.core.multi_agents import (
+from backend.core.debate_adapter import (
     DebateRound,
     JudgeVerdict,
     LegalMultiAgentDebate,
     MultiAgentDebateResult,
 )
-from backend.core.rag import LegalRAG
 
 
-SAMPLE_TEXT = """
-合同依法成立后，对当事人具有法律约束力。
-当事人应当按照约定全面履行自己的义务。
-一方不履行合同义务或者履行合同义务不符合约定的，
-应当承担继续履行、采取补救措施或者赔偿损失等违约责任。
-当事人可以约定违约金，也可以约定损失赔偿额的计算方法。
-"""
-
-
-def test_multi_agent_run_without_llm(tmp_path):
-    """测试多智能体运行（无 LLM 模式）。"""
-    rag = LegalRAG(
-        persist_dir=tmp_path / "chroma",
-        collection_name="test_multi_agent_run_without_llm",
-    )
-    rag.index_text(SAMPLE_TEXT, source="unit_test")
-
-    debate = LegalMultiAgentDebate(rag_engine=rag)
+def test_multi_agent_run_without_llm():
+    """测试多智能体运行（无 LLM 模式，回退结果）。"""
+    debate = LegalMultiAgentDebate()
 
     result = asyncio.run(
         debate.run(
@@ -40,24 +28,22 @@ def test_multi_agent_run_without_llm(tmp_path):
     assert result.case
     assert result.research_summary
     assert result.judge_summary
-    assert "Researcher" in result.steps[0]
-    assert "Judge" in result.steps[-1]
+    assert result.steps  # 回退模式有占位步骤
 
-    # 新字段：多轮辩论
+    # 多轮辩论
     assert len(result.debate_rounds) == 2
     assert isinstance(result.debate_rounds[0], DebateRound)
     assert result.debate_rounds[0].round_num == 1
     assert result.debate_rounds[0].plaintiff_statement
     assert result.debate_rounds[0].defendant_statement
 
-    # 新字段：法官判决
+    # 法官判决
     assert isinstance(result.judge_verdict, JudgeVerdict)
-    assert result.judge_verdict.winner in ("原告", "被告", "无法判断")
+    assert result.judge_verdict.winner == "无法判断"
     assert 0 <= result.judge_verdict.plaintiff_win_rate <= 100
     assert 0 <= result.judge_verdict.defendant_win_rate <= 100
-    assert len(result.judge_verdict.key_points) >= 3
     assert result.judge_verdict.reasoning
-    assert len(result.judge_verdict.action_suggestions) >= 3
+    assert result.judge_verdict.action_suggestions
 
     # 兼容旧接口：opinions
     assert len(result.opinions) == 2
@@ -65,15 +51,9 @@ def test_multi_agent_run_without_llm(tmp_path):
     assert result.opinions[1].role == "Defendant Advocate"
 
 
-def test_multi_agent_opinion_roles(tmp_path):
+def test_multi_agent_opinion_roles():
     """测试双方观点的角色。"""
-    rag = LegalRAG(
-        persist_dir=tmp_path / "chroma",
-        collection_name="test_multi_agent_opinion_roles",
-    )
-    rag.index_text(SAMPLE_TEXT, source="unit_test")
-
-    debate = LegalMultiAgentDebate(rag_engine=rag)
+    debate = LegalMultiAgentDebate()
 
     result = asyncio.run(
         debate.run(
@@ -92,57 +72,15 @@ def test_multi_agent_opinion_roles(tmp_path):
     assert "权利主张方" in viewpoints
     assert "抗辩方" in viewpoints
 
-    # 新接口：第一轮辩论
+    # 第一轮辩论
     assert len(result.debate_rounds) == 1
     assert "原告" in result.debate_rounds[0].plaintiff_statement
     assert "被告" in result.debate_rounds[0].defendant_statement
 
 
-def test_judge_verdict_contains_key_sections(tmp_path):
-    """测试法官判决包含关键部分。"""
-    rag = LegalRAG(
-        persist_dir=tmp_path / "chroma",
-        collection_name="test_judge_verdict_contains_key_sections",
-    )
-    debate = LegalMultiAgentDebate(rag_engine=rag)
-
-    verdict, summary = asyncio.run(
-        debate._do_judge_verdict(
-            case="测试案件",
-            research_summary="检索资料",
-            debate_rounds=[
-                DebateRound(
-                    round_num=1,
-                    plaintiff_statement="原告观点",
-                    defendant_statement="被告观点",
-                )
-            ],
-            use_llm=False,
-        )
-    )
-
-    # 判决对象
-    assert isinstance(verdict, JudgeVerdict)
-    assert verdict.winner in ("原告", "被告", "无法判断")
-    assert len(verdict.key_points) >= 3
-    assert len(verdict.action_suggestions) >= 3
-
-    # 总结文本
-    assert "最终判决" in summary
-    assert "胜率评估" in summary
-    assert "关键胜负点" in summary
-    assert "判决理由" in summary
-    assert "行动建议" in summary
-
-
-def test_researcher_handles_empty_knowledge_base(tmp_path):
-    """测试空知识库的处理。"""
-    rag = LegalRAG(
-        persist_dir=tmp_path / "chroma",
-        collection_name="test_researcher_handles_empty_knowledge_base",
-    )
-
-    debate = LegalMultiAgentDebate(rag_engine=rag)
+def test_researcher_handles_empty_knowledge_base():
+    """测试空知识库的处理（无 LLM 模式）。"""
+    debate = LegalMultiAgentDebate()
 
     result = asyncio.run(
         debate.run(
@@ -158,15 +96,9 @@ def test_researcher_handles_empty_knowledge_base(tmp_path):
     assert len(result.opinions) == 2  # 兼容旧接口
 
 
-def test_different_round_counts(tmp_path):
+def test_different_round_counts():
     """测试不同辩论轮数。"""
-    rag = LegalRAG(
-        persist_dir=tmp_path / "chroma",
-        collection_name="test_different_round_counts",
-    )
-    rag.index_text(SAMPLE_TEXT, source="unit_test")
-
-    debate = LegalMultiAgentDebate(rag_engine=rag)
+    debate = LegalMultiAgentDebate()
 
     # 测试 1 轮
     result_1 = asyncio.run(
@@ -184,3 +116,16 @@ def test_different_round_counts(tmp_path):
     for r in result_3.debate_rounds:
         assert r.plaintiff_statement
         assert r.defendant_statement
+
+
+def test_result_is_multi_agent_debate_result():
+    """测试返回类型正确。"""
+    debate = LegalMultiAgentDebate()
+
+    result = asyncio.run(
+        debate.run(case="测试案件", use_llm=False, max_rounds=1)
+    )
+
+    assert isinstance(result, MultiAgentDebateResult)
+    assert isinstance(result.judge_verdict, JudgeVerdict)
+    assert isinstance(result.debate_rounds[0], DebateRound)

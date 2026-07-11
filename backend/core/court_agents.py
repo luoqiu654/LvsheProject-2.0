@@ -12,7 +12,7 @@
 3. 判决修复"LLM 服务不可用"误导文案：
    - LLM 真正调用失败（LLMGatewayError）→ "LLM 调用失败，请检查网络和 API 配置"
    - LLM 返回内容但 JSON 解析失败 → 从自由文本提取判决（不用 fallback）
-4. 模型名从 ``multi_agents`` 模块导入（与 config 中 default_llm_model / chat_models 一致），不硬编码。
+4. 模型名从 ``court_constants`` 模块导入（与 config 中 default_llm_model / chat_models 一致），不硬编码。
 """
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ from typing import Any, AsyncGenerator, Optional
 from backend.core.llm_gateway import LLMGateway, LLMGatewayError
 from backend.core.rag import LegalRAG
 from backend.core.skills import SkillRegistry
-# 复用 multi_agents.py 的角色 prompt 与模型常量（值与 config 中模型清单一致，不在此硬编码）
-from backend.core.multi_agents import (
+# 复用 court_constants.py 的角色 prompt 与模型常量（值与 config 中模型清单一致，不在此硬编码）
+from backend.core.court_constants import (
     MODEL_DECISION,
     MODEL_SPEECH,
     MODEL_VERDICT,

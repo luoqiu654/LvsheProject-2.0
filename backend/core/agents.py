@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
 import operator
 import re
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.core.llm_gateway import LLMGateway, LLMGatewayError, gateway as default_gateway
 from backend.core.rag import LegalRAG, rag as default_rag
+
+logger = logging.getLogger(__name__)
 
 
 ToolName = Literal["law_search", "contract_risk_check", "calculator", "direct_answer"]
@@ -146,11 +149,30 @@ class LegalAgent:
         workflow.add_node("final", self._final_node)
 
         workflow.add_edge(START, "plan")
-        workflow.add_edge("plan", "tool")
-        workflow.add_edge("tool", "final")
+        workflow.add_conditional_edges(
+            "plan",
+            self._should_use_tool,
+            {True: "tool", False: "final"},
+        )
+        workflow.add_conditional_edges(
+            "tool",
+            self._should_continue_tools,
+            {True: "plan", False: "final"},
+        )
         workflow.add_edge("final", END)
 
         return workflow.compile()
+
+    def _should_use_tool(self, state: LegalAgentState) -> bool:
+        """检查是否需要调用工具。保持当前行为：始终进入工具节点。"""
+        return True
+
+    def _should_continue_tools(self, state: LegalAgentState) -> bool:
+        """检查是否需要继续调用工具（最多 3 次工具调用避免无限循环）。"""
+        step_count = len(state.get("steps", []))
+        if step_count >= 3:
+            return False
+        return False  # 保持当前行为，后续可扩展
 
     async def run(
         self,
@@ -310,7 +332,8 @@ JSON 格式：
 
             return plan
 
-        except Exception:
+        except Exception as exc:
+            logger.warning("LLM 规划失败，使用规则兜底: %s", exc, exc_info=True)
             return self._fallback_plan(question)
 
     def _fallback_plan(self, question: str) -> dict[str, Any]:
@@ -408,6 +431,7 @@ JSON 格式：
             result = self.calculator.calculate(expression)
             return f"计算表达式：{expression}\n计算结果：{result}"
         except Exception as exc:
+            logger.warning("计算器执行失败: %s", exc)
             return f"计算失败：{exc}"
 
     async def _llm_final_answer(
@@ -444,7 +468,8 @@ JSON 格式：
                 max_tokens=1200,
                 temperature=0.2,
             )
-        except LLMGatewayError:
+        except LLMGatewayError as exc:
+            logger.warning("LLM 最终回答失败，使用模板兜底: %s", exc)
             return self._fallback_final_answer(question, tool_name, tool_result)
 
     def _fallback_final_answer(
