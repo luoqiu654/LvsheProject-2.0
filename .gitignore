@@ -12,6 +12,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.example.*
 
 # cache
 .pytest_cache/
@@ -73,3 +74,6 @@ tests/stream_debug.txt
 
 # Neo4j 运行时数据
 .neo4j*
+
+# Reports（内部文档，不提交至仓库）
+reports/

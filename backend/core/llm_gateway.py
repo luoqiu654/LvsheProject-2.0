@@ -40,17 +40,17 @@ def _detect_mime_from_bytes(data: bytes) -> str:
 
 
 @dataclass(frozen=True)
-class ZhipuModelConfig:
+class ProviderModelConfig:
     """
-    智谱 AI 单个模型配置。
+    LLM 供应商单个模型配置。
 
-    所有 6 个模型共用同一个 API Key 和 Base URL，
-    只是模型名不同、用途不同。
+    支持多供应商（智谱AI / 百炼 / 通用OpenAI兼容接口），
+    所有供应商共用同一个数据结构，只是模型名和 API 地址不同。
 
-    - model: 模型名（如 glm-4.7-flash / glm-ocr / glm-image）
+    - model: 模型名（如 glm-4.7-flash / qwen-plus / gpt-4o）
     - model_type: 模型类型（text / vision / image）
     - api_key 只来自 .env
-    - model_for_litellm 统一使用 openai/ 前缀（智谱 OpenAI 兼容接口）
+    - model_for_litellm 统一使用 openai/ 前缀（OpenAI 兼容接口）
     - api_key 字段在 repr 中隐藏（避免密钥泄露）
     """
 
@@ -66,12 +66,16 @@ class ZhipuModelConfig:
     def safe_repr(self) -> str:
         """安全的表示形式，不暴露完整密钥。"""
         return (
-            f"ZhipuModelConfig("
+            f"ProviderModelConfig("
             f"model={self.model!r}, "
             f"model_type={self.model_type!r}, "
             f"api_key={_mask_api_key(self.api_key)!r}, "
             f"api_base={self.api_base!r})"
         )
+
+
+# 向后兼容别名
+ZhipuModelConfig = ProviderModelConfig
 
 
 class LLMGatewayError(RuntimeError):
@@ -80,36 +84,30 @@ class LLMGatewayError(RuntimeError):
 
 class LLMGateway:
     """
-    智谱 AI 统一 LLM 网关。
+    多供应商统一 LLM 网关。
 
-    当前支持 6 个模型，全部接入智谱 AI (BigModel) 平台：
+    支持通过 LLM_PROVIDER 环境变量切换供应商：
+    - zhipu（智谱AI）：GLM-4.7-Flash / GLM-4.6 / GLM-5.2 / GLM-OCR / GLM-Image
+    - dashscope（百炼/通义千问）：qwen-turbo / qwen-plus / qwen-max / qwen-vl-max
+    - openai（通用OpenAI兼容）：适用于任何 OpenAI 兼容接口的供应商
 
-    语言模型（文本对话）：
-    1. glm-4.7-flash   — 轻量高速，适合日常对话
-    2. glm-4.7-flashx  — 轻量高速增强版
-    3. glm-4.6         — 通用文本模型
-    4. glm-5.2         — 旗舰模型，长程任务与代码
-
-    视觉模型（文档分析）：
-    5. glm-ocr         — 图片/扫描件文字识别
-
-    图像生成模型（文档批注与图片生成）：
-    6. glm-image       — 图片生成
+    所有供应商通过 LiteLLM + openai/ 前缀统一接入，业务代码无需感知供应商差异。
 
     设计原则：
     - 业务代码不直接调用具体厂商 SDK
     - 业务代码不读取 API Key
     - Agent / RAG / Multi-Agent 统一依赖本类
-    - 所有模型共用同一个 API Key
+    - 切换供应商只需修改 .env 中的 LLM_PROVIDER 和对应 API Key
     """
 
     def __init__(self) -> None:
-        self._api_key: Optional[str] = self._secret_to_str(settings.zhipu_api_key)
-        self._api_base: str = settings.zhipu_base_url
-        self._default_model: str = settings.default_llm_model
-        self._vision_model: str = settings.zhipu_vision_model
-        self._image_model: str = settings.zhipu_image_model
-        self._chat_models: list[str] = settings.chat_models_list
+        self._provider: str = settings.active_provider
+        self._api_key: Optional[str] = self._secret_to_str(settings.active_api_key)
+        self._api_base: str = settings.active_base_url
+        self._default_model: str = settings.active_default_model
+        self._vision_model: str = settings.active_vision_model
+        self._image_model: str = settings.active_image_model
+        self._chat_models: list[str] = settings.active_chat_models_list
 
     def _secret_to_str(self, value: Any) -> Optional[str]:
         if value is None:
@@ -128,8 +126,16 @@ class LLMGateway:
     def _ensure_available(self) -> None:
         """确保 API Key 已配置。"""
         if not self.is_available:
+            provider = self._provider
+            key_map = {
+                "zhipu": "ZHIPU_API_KEY",
+                "dashscope": "DASHSCOPE_API_KEY",
+                "openai": "OPENAI_COMPAT_API_KEY",
+            }
+            env_name = key_map.get(provider, "LLM API Key")
             raise LLMGatewayError(
-                "智谱 API Key 未配置。请在 .env 中设置 ZHIPU_API_KEY。"
+                f"LLM API Key 未配置（当前供应商: {provider}）。"
+                f"请在 .env 中设置 {env_name}。"
             )
 
     def _resolve_model(self, model: Optional[str]) -> str:
@@ -152,7 +158,7 @@ class LLMGateway:
 
         return model
 
-    def _build_config(self, model: Optional[str] = None, model_type: ModelType = "text") -> ZhipuModelConfig:
+    def _build_config(self, model: Optional[str] = None, model_type: ModelType = "text") -> ProviderModelConfig:
         """构建模型配置。"""
         self._ensure_available()
 
@@ -187,7 +193,7 @@ class LLMGateway:
             return []
         return list(self._chat_models) + [self._vision_model, self._image_model]
 
-    def get_provider_config(self, provider: Optional[str] = None) -> ZhipuModelConfig:
+    def get_provider_config(self, provider: Optional[str] = None) -> ProviderModelConfig:
         """
         获取指定模型的配置。
 
@@ -503,14 +509,6 @@ class LLMGateway:
                 f"（上限 5000000）。请压缩图片后重试。"
             )
 
-        # 模型名校验：确保使用有效的智谱视觉模型名（glm-ocr）
-        if "glm-ocr" not in model_name.lower():
-            print(
-                f"[LLMGateway] 视觉模型名 '{model_name}' 非有效智谱视觉模型，"
-                f"强制使用 glm-ocr"
-            )
-            model_name = "glm-ocr"
-
         # 详细日志（调试用）
         print(f"[LLMGateway] chat_with_vision 调用参数：")
         print(f"  model_name: {model_name}")
@@ -721,7 +719,7 @@ class LLMGateway:
         )
 
         return {
-            "provider": "zhipu",
+            "provider": self._provider,
             "model": model_name,
             "api_base": config.api_base,
             "ok": "OK" in text.upper(),
@@ -733,11 +731,12 @@ gateway = LLMGateway()
 
 
 async def _demo() -> None:
+    print(f"当前供应商: {gateway._provider}")
     print("可用文本模型：", gateway.available_providers())
     print("所有模型：", gateway.available_models())
 
     if not gateway.is_available:
-        print("⚠️ 未配置 ZHIPU_API_KEY，请检查 .env")
+        print("⚠️ LLM API Key 未配置，请检查 .env")
         return
 
     # 测试默认模型

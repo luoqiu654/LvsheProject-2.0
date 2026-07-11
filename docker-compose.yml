@@ -1,0 +1,61 @@
+services:
+  # ===== 法律 AI Agent 主服务 =====
+  lvshe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lvshe-app
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - APP_ENV=production
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+    volumes:
+      # 持久化数据（向量库、记忆、上传文件、合同审查输出）
+      - lvshe-vector-store:/app/data/vector_store
+      - lvshe-memory:/app/data/memory
+      - lvshe-uploads:/app/data/uploads
+      - lvshe-output:/app/output
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    depends_on:
+      neo4j:
+        condition: service_healthy
+        required: false
+
+  # ===== Neo4j 图数据库（Graph RAG，可选） =====
+  neo4j:
+    image: neo4j:5-community
+    container_name: lvshe-neo4j
+    ports:
+      - "7474:7474"  # Neo4j Browser
+      - "7687:7687"  # Bolt 协议
+    environment:
+      - NEO4J_AUTH=neo4j/password
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - lvshe-neo4j-data:/data
+      - lvshe-neo4j-logs:/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:7474 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    profiles:
+      - graph-rag
+
+volumes:
+  lvshe-vector-store:
+  lvshe-memory:
+  lvshe-uploads:
+  lvshe-output:
+  lvshe-neo4j-data:
+  lvshe-neo4j-logs:

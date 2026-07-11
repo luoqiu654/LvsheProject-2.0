@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any, AsyncGenerator, Callable, Optional
 
 from backend.core.llm_gateway import LLMGateway, LLMGatewayError, gateway as default_gateway
+from backend.config import settings
 
 
 # ========== 角色常量 ==========
@@ -83,11 +84,11 @@ SYSTEM_JUDGE = (
     "你是犀利、专业、公正的法官。"
 )
 
-# ========== 模型选择 ==========
+# ========== 模型选择（从配置读取，支持多供应商） ==========
 
-MODEL_SPEECH = "glm-4.7-flash"    # 陈述/回答（有思考过程可展示）
-MODEL_DECISION = "glm-4.6"        # 法官追问决策（稳定 JSON）
-MODEL_VERDICT = "glm-5.2"         # 最终判决（旗舰）
+MODEL_SPEECH = settings.active_model_speech    # 陈述/回答（有思考过程可展示）
+MODEL_DECISION = settings.active_model_decision  # 法官追问决策（稳定 JSON）
+MODEL_VERDICT = settings.active_model_verdict    # 最终判决（旗舰）
 
 # 当事人"不清楚"关键事实的关键词（触发向用户询问）
 UNCLEAR_PATTERNS = (

@@ -431,7 +431,7 @@ class ContractPipeline:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            model="glm-4.6",
+            model=settings.active_model_decision,
             temperature=0.2,
             max_tokens=4096,
         )

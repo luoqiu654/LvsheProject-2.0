@@ -1,7 +1,7 @@
 [project]
 name = "lvsheproject"
 version = "0.1.0"
-description = "法律AI平台复刻 - 红岩网校Agent方向考核项目"
+description = "法律 AI Agent 系统 - 多智能体法庭模拟 + RAG + 多供应商 LLM 网关"
 readme = "README.md"
 requires-python = ">=3.14"
 packages = ["backend"]

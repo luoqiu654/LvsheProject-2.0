@@ -139,6 +139,7 @@ async def status() -> StatusResponse:
     )
 
 
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     try:
@@ -1350,9 +1351,9 @@ async def models_info() -> ModelsInfoResponse:
     """
     return ModelsInfoResponse(
         text_models=gateway.available_providers(),
-        vision_model=settings.zhipu_vision_model,
-        image_model=settings.zhipu_image_model,
-        default_model=settings.default_llm_model,
+        vision_model=settings.active_vision_model,
+        image_model=settings.active_image_model,
+        default_model=settings.active_default_model,
     )
 
 
@@ -1374,7 +1375,7 @@ async def vision_analyze(request: VisionAnalyzeRequest) -> VisionAnalyzeResponse
         )
 
         return VisionAnalyzeResponse(
-            model=settings.zhipu_vision_model,
+            model=settings.active_vision_model,
             text=text,
             char_count=len(text),
         )
@@ -1403,7 +1404,7 @@ async def vision_analyze_file(
         )
 
         return VisionAnalyzeResponse(
-            model=settings.zhipu_vision_model,
+            model=settings.active_vision_model,
             text=text,
             char_count=len(text),
         )
@@ -1431,7 +1432,7 @@ async def image_generate(request: ImageGenerateRequest) -> ImageGenerateResponse
         )
 
         return ImageGenerateResponse(
-            model=settings.zhipu_image_model,
+            model=settings.active_image_model,
             image_paths=image_paths,
             image_count=len(image_paths),
             prompt=request.prompt,
